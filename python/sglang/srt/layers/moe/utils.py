@@ -388,6 +388,48 @@ def is_deepep_class_backend() -> bool:
     return b.is_deepep() or b.is_mooncake() or b.is_mori()
 
 
+def uses_a2a_moe_forward() -> bool:
+    """Return whether the active backend uses the A2A MoE forward path."""
+    b = get_moe_a2a_backend()
+    return (
+        b.is_deepep()
+        or b.is_mooncake()
+        or b.is_nixl()
+        or b.is_mori()
+        or b.is_ascend_fuseep()
+        or b.is_flashinfer()
+        or b.is_ncclep()
+    )
+
+
+def uses_a2a_expert_parallel_metadata() -> bool:
+    """Return whether the backend needs EP metadata on DeepSeek MoE layers."""
+    b = get_moe_a2a_backend()
+    return (
+        b.is_deepep()
+        or b.is_mooncake()
+        or b.is_nixl()
+        or b.is_mori()
+        or b.is_ascend_fuseep()
+        or b.is_ncclep()
+    )
+
+
+def requires_shared_expert_tp1() -> bool:
+    """Return whether shared experts should be materialized with TP=1."""
+    b = get_moe_a2a_backend()
+    return (
+        b.is_deepep()
+        or b.is_mooncake()
+        or b.is_nixl()
+        or b.is_mori()
+        or b.is_ascend_fuseep()
+        or b.is_flashinfer()
+        or b.is_megamoe()
+        or b.is_ncclep()
+    )
+
+
 def is_flashinfer_cutedsl_v1_path() -> bool:
     """CuteDSL v1 + DeepEP low-latency path (no MoeRunner, no autotune)."""
     return (

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import ctypes
 import logging
+import os
 from enum import Enum, auto
+from pathlib import Path
 from typing import List, NamedTuple, Optional, Tuple
 
 import torch
@@ -23,8 +26,85 @@ from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_qua
 logger = logging.getLogger(__name__)
 
 _SCALE_BLOCK_SIZE = 128
+_ncclep_import_error: Optional[BaseException] = None
+
+
+def _dlopen_global(path: Path, label: str) -> None:
+    mode = getattr(os, "RTLD_NOW", ctypes.DEFAULT_MODE) | getattr(
+        os, "RTLD_GLOBAL", ctypes.RTLD_GLOBAL
+    )
+    try:
+        ctypes.CDLL(str(path), mode=mode)
+    except OSError as exc:
+        raise ImportError(f"Failed to load {label} from {path}: {exc}") from exc
+
+
+def _configured_ep_so_path() -> Optional[Path]:
+    so_path = envs.SGLANG_NCCL_EP_SO_PATH.get()
+    if not so_path:
+        return None
+    path = Path(so_path).expanduser()
+    if not path.is_file():
+        raise ImportError(f"SGLANG_NCCL_EP_SO_PATH does not exist: {path}")
+    return path.resolve()
+
+
+def _find_sibling_nccl_so(ep_so_path: Path) -> Optional[Path]:
+    for name in ("libnccl.so.2", "libnccl.so"):
+        candidate = ep_so_path.parent / name
+        if candidate.is_file():
+            return candidate.resolve()
+    return None
+
+
+def _configure_jit_build_include_dir(ep_so_path: Optional[Path]) -> None:
+    include_candidates = []
+    if ep_so_path is not None:
+        include_candidates.append(ep_so_path.parent.parent / "include")
+    nccl_home = os.environ.get("NCCL_HOME")
+    if nccl_home:
+        home = Path(nccl_home).expanduser()
+        include_candidates.extend([home / "build" / "include", home / "include"])
+
+    for include_dir in include_candidates:
+        if (include_dir / "nccl_device" / "gin.h").is_file():
+            resolved = str(include_dir.resolve())
+            if ep_so_path is not None:
+                os.environ["NCCL_EP_JIT_BUILD_INCLUDE_DIR"] = resolved
+            else:
+                os.environ.setdefault("NCCL_EP_JIT_BUILD_INCLUDE_DIR", resolved)
+            return
+
+
+def _preload_configured_ncclep_libraries() -> None:
+    ep_so_path = _configured_ep_so_path()
+    _configure_jit_build_include_dir(ep_so_path)
+    if ep_so_path is None:
+        return
+    nccl_so_path = _find_sibling_nccl_so(ep_so_path)
+    if nccl_so_path is not None:
+        _dlopen_global(nccl_so_path, "libnccl.so")
+    _dlopen_global(ep_so_path, "libnccl_ep.so")
+
+
+def _loaded_library_path(soname: str) -> Optional[Path]:
+    try:
+        with open("/proc/self/maps") as f:
+            for line in f:
+                parts = line.rstrip().split(maxsplit=5)
+                if len(parts) < 6:
+                    continue
+                path = Path(parts[5])
+                name = path.name
+                if name == soname or name.startswith(f"{soname}."):
+                    return path.resolve()
+    except OSError:
+        return None
+    return None
+
 
 try:
+    _preload_configured_ncclep_libraries()
     from nccl.ep import (
         Algorithm,
         CombineInputs,
@@ -42,8 +122,9 @@ try:
     from nccl.ep.interop.torch import get_nccl_comm_from_group
 
     use_ncclep = True
-except ImportError:
+except (ImportError, OSError) as exc:
     use_ncclep = False
+    _ncclep_import_error = exc
 
 
 class NcclEpHighThroughputDispatchOutput(NamedTuple):
@@ -123,6 +204,7 @@ class NcclEpBuffer:
     _comm = None
     _ep_group: Optional["Group"] = None
     _group_key: Optional[Tuple] = None
+    _library_paths_logged = False
 
     @classmethod
     def get_group(
@@ -135,10 +217,17 @@ class NcclEpBuffer:
         num_local_experts: int,
     ):
         if not use_ncclep:
+            detail = (
+                f" Original import error: {_ncclep_import_error}"
+                if _ncclep_import_error is not None
+                else ""
+            )
             raise ImportError(
                 "NCCL_EP is not available. Build/install nccl4py from "
                 "<nccl>/bindings/nccl4py and ensure libnccl_ep.so is loadable."
+                + detail
             )
+        cls._log_and_validate_loaded_libraries()
 
         world_size = dist.get_world_size(group)
         # NCCL_EP HT FLAT receives at most one row from each source rank for a
@@ -184,6 +273,49 @@ class NcclEpBuffer:
             hidden_size,
         )
         return cls._comm, cls._ep_group
+
+    @classmethod
+    def _log_and_validate_loaded_libraries(cls) -> None:
+        if cls._library_paths_logged:
+            return
+        cls._library_paths_logged = True
+
+        loaded_nccl = _loaded_library_path("libnccl.so")
+        loaded_ep = _loaded_library_path("libnccl_ep.so")
+        configured_ep = _configured_ep_so_path()
+        logger.info(
+            "NCCL_EP loaded libraries: libnccl=%s libnccl_ep=%s "
+            "configured_libnccl_ep=%s jit_build_include=%s",
+            loaded_nccl,
+            loaded_ep,
+            configured_ep,
+            os.environ.get("NCCL_EP_JIT_BUILD_INCLUDE_DIR"),
+        )
+
+        if configured_ep is None:
+            return
+        if loaded_ep is not None and loaded_ep != configured_ep:
+            logger.warning(
+                "SGLANG_NCCL_EP_SO_PATH points to %s, but libnccl_ep.so was loaded from %s. "
+                "Ensure this is intentional before comparing NCCL_EP results.",
+                configured_ep,
+                loaded_ep,
+            )
+
+        configured_nccl = _find_sibling_nccl_so(configured_ep)
+        if (
+            configured_nccl is not None
+            and loaded_nccl is not None
+            and loaded_nccl != configured_nccl
+        ):
+            logger.warning(
+                "NCCL_EP is configured from %s, but libnccl.so was loaded from %s; "
+                "the sibling NCCL library is %s. Use LD_PRELOAD or LD_LIBRARY_PATH "
+                "when a strict NCCL/NCCL_EP pair is required.",
+                configured_ep,
+                loaded_nccl,
+                configured_nccl,
+            )
 
     @classmethod
     def destroy(cls):
