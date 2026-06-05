@@ -353,8 +353,17 @@ class _NcclEpHighThroughputImpl(_NcclEpImplBase):
         recv_topk_ids = self._recv_topk_ids[: self._num_recv_tokens]
         recv_topk_weights = self._recv_topk_weights[: self._num_recv_tokens]
 
-        local_expert_start = self.rank * self.num_local_experts
-        local_topk_ids = recv_topk_ids - local_expert_start
+        valid_recv_topk = recv_topk_ids[recv_topk_ids >= 0]
+        if valid_recv_topk.numel() == 0:
+            local_topk_ids = recv_topk_ids
+        elif int(valid_recv_topk.max().item()) < self.num_local_experts:
+            # The current nccl.ep HT FLAT Python path returns local expert ids.
+            local_topk_ids = recv_topk_ids
+        else:
+            # Keep a fallback for native paths that return global expert ids.
+            local_expert_start = self.rank * self.num_local_experts
+            local_topk_ids = recv_topk_ids - local_expert_start
+
         local_mask = (local_topk_ids >= 0) & (local_topk_ids < self.num_local_experts)
         local_topk_ids = torch.where(
             local_mask, local_topk_ids, torch.full_like(local_topk_ids, -1)
@@ -514,7 +523,11 @@ class NcclEpDispatcher(BaseDispatcher):
         if ncclep_mode.is_high_throughput():
             self._impl = _NcclEpHighThroughputImpl(**common)
         elif ncclep_mode.is_low_latency():
-            self._impl = _NcclEpLowLatencyImpl(**common)
+            raise NotImplementedError(
+                "NCCL_EP low_latency FP8 dispatch is not supported by native NCCL_EP "
+                "yet. The current SGLang NCCL_EP backend only supports "
+                "high_throughput FP8 dispatch for DeepGEMM runner correctness."
+            )
         else:
             raise ValueError(f"Unsupported NCCL_EP mode: {ncclep_mode}")
         self._stage = _Stage.INITIAL
