@@ -26,6 +26,9 @@ from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_qua
 logger = logging.getLogger(__name__)
 
 _SCALE_BLOCK_SIZE = 128
+_LL_FP8_SCALE_ALIGNMENT = 512
+_LL_MAX_TOPK = 9
+_LL_MAX_DISPATCH_TOKENS_PER_RANK = 1024
 _ncclep_import_error: Optional[BaseException] = None
 
 
@@ -107,6 +110,7 @@ try:
     _preload_configured_ncclep_libraries()
     from nccl.ep import (
         Algorithm,
+        CombineConfig,
         CombineInputs,
         CombineOutputs,
         DispatchConfig,
@@ -230,6 +234,24 @@ class NcclEpBuffer:
         cls._log_and_validate_loaded_libraries()
 
         world_size = dist.get_world_size(group)
+        if num_max_dispatch_tokens_per_rank <= 0:
+            raise ValueError(
+                "NCCL_EP requires positive max_dispatch_tokens_per_rank, got "
+                f"{num_max_dispatch_tokens_per_rank}"
+            )
+        if mode.is_low_latency():
+            if num_max_dispatch_tokens_per_rank > _LL_MAX_DISPATCH_TOKENS_PER_RANK:
+                raise ValueError(
+                    "NCCL_EP low_latency adapter caps max_dispatch_tokens_per_rank "
+                    f"at {_LL_MAX_DISPATCH_TOKENS_PER_RANK}, got "
+                    f"{num_max_dispatch_tokens_per_rank}."
+                )
+            if hidden_size % _LL_FP8_SCALE_ALIGNMENT != 0:
+                raise ValueError(
+                    "NCCL_EP low_latency FP8 dispatch with output scales requires "
+                    f"hidden_size multiple of {_LL_FP8_SCALE_ALIGNMENT}, got {hidden_size}."
+                )
+
         # NCCL_EP HT FLAT receives at most one row from each source rank for a
         # dispatched token. Match the native Python UT / README group-config
         # budget: max_recv_tokens_per_rank = nRanks * max_dispatch_tokens_per_rank.
@@ -257,13 +279,16 @@ class NcclEpBuffer:
             max_dispatch_tokens_per_rank=num_max_dispatch_tokens_per_rank,
             max_recv_tokens_per_rank=max_recv_tokens_per_rank,
             max_token_bytes=hidden_size * 2,
+            num_qp_per_rank=(
+                num_local_experts if mode.is_low_latency() else 0
+            ),
         )
         cls._ep_group = Group.create(cls._comm, config)
         cls._group_key = key
         logger.info(
             "Initialized NCCL_EP group: mode=%s world_size=%s num_experts=%s "
             "num_local_experts=%s max_dispatch_tokens_per_rank=%s "
-            "max_recv_tokens_per_rank=%s hidden_size=%s",
+            "max_recv_tokens_per_rank=%s hidden_size=%s num_qp_per_rank=%s",
             mode.value,
             world_size,
             num_experts,
@@ -271,6 +296,7 @@ class NcclEpBuffer:
             num_max_dispatch_tokens_per_rank,
             max_recv_tokens_per_rank,
             hidden_size,
+            num_local_experts if mode.is_low_latency() else 0,
         )
         return cls._comm, cls._ep_group
 
@@ -387,6 +413,10 @@ class _NcclEpImplBase:
         if topk_ids.shape[1] != self.router_topk:
             raise ValueError(
                 f"NCCL_EP topk mismatch: expected {self.router_topk}, got {topk_ids.shape[1]}"
+            )
+        if self.mode.is_low_latency() and topk_ids.shape[1] > _LL_MAX_TOPK:
+            raise ValueError(
+                f"NCCL_EP low_latency supports topk <= {_LL_MAX_TOPK}, got {topk_ids.shape[1]}"
             )
 
 
@@ -547,21 +577,37 @@ class _NcclEpLowLatencyImpl(_NcclEpImplBase):
 
     def _ensure_buffers(self) -> None:
         max_slots = self.max_recv_tokens_per_rank
-        if self._output_tokens is not None:
-            return
+        token_shape = (self.num_local_experts, max_slots, self.hidden_size)
+        scale_shape = (
+            self.num_local_experts,
+            max_slots,
+            self.hidden_size // _SCALE_BLOCK_SIZE,
+        )
+        count_shape = (self.num_local_experts,)
+        # DeepGEMM owns and disposes runner inputs after GEMM, so LL dispatch
+        # outputs cannot be treated as reusable dispatcher-owned buffers.
         self._output_tokens = torch.empty(
-            (self.num_local_experts, max_slots, self.hidden_size),
+            token_shape,
             dtype=torch.float8_e4m3fn,
             device="cuda",
         )
         self._output_scales = torch.empty(
-            (self.num_local_experts, max_slots, self.hidden_size // _SCALE_BLOCK_SIZE),
+            scale_shape,
             dtype=torch.float32,
             device="cuda",
         )
-        self._recv_count = torch.zeros(
-            self.num_local_experts, dtype=torch.int32, device="cuda"
-        )
+        if self._recv_count is None or tuple(self._recv_count.shape) != count_shape:
+            self._recv_count = torch.zeros(count_shape, dtype=torch.int32, device="cuda")
+        if tuple(self._output_tokens.shape) != token_shape:
+            raise RuntimeError(
+                "Failed to allocate NCCL_EP low_latency output token buffer: "
+                f"got {tuple(self._output_tokens.shape)}, expected {token_shape}"
+            )
+        if tuple(self._output_scales.shape) != scale_shape:
+            raise RuntimeError(
+                "Failed to allocate NCCL_EP low_latency output scale buffer: "
+                f"got {tuple(self._output_scales.shape)}, expected {scale_shape}"
+            )
 
     def dispatch(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
         topk_weights = topk_output.topk_weights
@@ -571,6 +617,8 @@ class _NcclEpLowLatencyImpl(_NcclEpImplBase):
         num_tokens = hidden_states.shape[0]
         self._ensure_buffers()
         self._recv_count.zero_()
+        self._output_tokens.zero_()
+        self._output_scales.zero_()
 
         self._destroy_handle()
         self._handle = ep_group.create_handle(
@@ -578,17 +626,28 @@ class _NcclEpLowLatencyImpl(_NcclEpImplBase):
             Tensor(topk_ids),
             stream=_stream(),
         )
+        output_tokens = Tensor(self._output_tokens)
+        output_scales = Tensor(self._output_scales)
+        if output_tokens.ndim != 3 or output_scales.ndim != 3:
+            raise RuntimeError(
+                "NCCL_EP low_latency dispatch expects 3D output tensors, got "
+                f"tokens={output_tokens.sizes}, scales={output_scales.sizes}"
+            )
         layout_info = LayoutInfo(expert_counters=Tensor(self._recv_count))
+        dispatch_inputs = DispatchInputs(tokens=Tensor(hidden_states))
+        dispatch_outputs = DispatchOutputs(
+            tokens=output_tokens,
+            scales=output_scales,
+        )
+        dispatch_config = DispatchConfig(round_scales=0)
         self._handle.dispatch(
-            DispatchInputs(tokens=Tensor(hidden_states)),
-            DispatchOutputs(
-                tokens=Tensor(self._output_tokens),
-                scales=Tensor(self._output_scales),
-            ),
+            dispatch_inputs,
+            dispatch_outputs,
             layout_info=layout_info,
-            config=DispatchConfig(round_scales=0),
+            config=dispatch_config,
             stream=_stream(),
         )
+        self._handle.complete(stream=_stream())
         torch.cuda.synchronize()
 
         expected_m = (
@@ -611,11 +670,19 @@ class _NcclEpLowLatencyImpl(_NcclEpImplBase):
             dtype=torch.bfloat16,
             device=hidden_states.device,
         )
+        combine_inputs = CombineInputs(tokens=Tensor(hidden_states))
+        combine_outputs = CombineOutputs(
+            tokens=Tensor(combined),
+            topk_weights=Tensor(topk_weights),
+        )
+        combine_config = CombineConfig(send_only=0)
         self._handle.combine(
-            CombineInputs(tokens=Tensor(hidden_states)),
-            CombineOutputs(tokens=Tensor(combined), topk_weights=Tensor(topk_weights)),
+            combine_inputs,
+            combine_outputs,
+            config=combine_config,
             stream=_stream(),
         )
+        self._handle.complete(stream=_stream())
         torch.cuda.synchronize()
         self._destroy_handle()
         return combined
@@ -657,11 +724,7 @@ class NcclEpDispatcher(BaseDispatcher):
         if ncclep_mode.is_high_throughput():
             self._impl = _NcclEpHighThroughputImpl(**common)
         elif ncclep_mode.is_low_latency():
-            raise NotImplementedError(
-                "NCCL_EP low_latency FP8 dispatch is not supported by native NCCL_EP "
-                "yet. The current SGLang NCCL_EP backend only supports "
-                "high_throughput FP8 dispatch for DeepGEMM runner correctness."
-            )
+            self._impl = _NcclEpLowLatencyImpl(**common)
         else:
             raise ValueError(f"Unsupported NCCL_EP mode: {ncclep_mode}")
         self._stage = _Stage.INITIAL
