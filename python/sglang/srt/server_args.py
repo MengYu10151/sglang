@@ -233,6 +233,7 @@ MOE_A2A_BACKEND_CHOICES = [
     "ascend_fuseep",
     "flashinfer",
     "megamoe",
+    "ncclep",
 ]
 
 FP8_GEMM_RUNNER_BACKEND_CHOICES = [
@@ -627,6 +628,7 @@ class ServerArgs:
         "ascend_fuseep",
         "flashinfer",
         "megamoe",
+        "ncclep",
     ] = "none"
     moe_runner_backend: str = "auto"
     flashinfer_mxfp4_moe_precision: Literal["default", "bf16"] = "default"
@@ -634,6 +636,7 @@ class ServerArgs:
     enforce_disable_flashinfer_allreduce_fusion: bool = False
     enable_aiter_allreduce_fusion: bool = False
     deepep_mode: Literal["auto", "normal", "low_latency"] = "auto"
+    ncclep_mode: Literal["high_throughput", "low_latency"] = "high_throughput"
     deepep_dispatcher_output_dtype: Literal["auto", "bf16", "fp8", "int8", "nvfp4"] = (
         "auto"
     )
@@ -5925,6 +5928,13 @@ class ServerArgs:
             "--enable-aiter-allreduce-fusion",
             action="store_true",
             help="Enable Aiter AllReduce Fusion.",
+        )
+        parser.add_argument(
+            "--ncclep-mode",
+            type=str,
+            choices=["high_throughput", "low_latency"],
+            default=ServerArgs.ncclep_mode,
+            help="Select NCCL_EP mode. Use high_throughput for prefill-style large-token dispatch and low_latency for decode-style small-token dispatch.",
         )
         parser.add_argument(
             "--deepep-mode",

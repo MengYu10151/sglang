@@ -32,6 +32,7 @@ from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import (
     MoeRunnerConfig,
     get_deepep_mode,
+    get_ncclep_mode,
     get_moe_a2a_backend,
     get_moe_runner_backend,
 )
@@ -42,6 +43,7 @@ from sglang.srt.layers.moe.kt_ep_wrapper import (
 from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
 from sglang.srt.layers.moe.token_dispatcher.base import BaseDispatcher
 from sglang.srt.layers.moe.token_dispatcher.flashinfer import FlashinferDispatcher
+from sglang.srt.layers.moe.token_dispatcher.ncclep import NcclEpDispatcher
 from sglang.srt.layers.moe.token_dispatcher.standard import (
     StandardDispatcher,
 )
@@ -113,6 +115,16 @@ def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
             deepep_mode=get_deepep_mode(),
             async_finish=True,
             return_recv_hook=True,
+        )
+    elif a2a_backend.is_ncclep():
+        return NcclEpDispatcher(
+            group=get_tp_group().device_group,
+            router_topk=moe_runner_config.top_k,
+            num_experts=moe_runner_config.num_experts,
+            num_local_experts=moe_runner_config.num_local_experts,
+            hidden_size=moe_runner_config.hidden_size,
+            params_dtype=moe_runner_config.params_dtype,
+            ncclep_mode=get_ncclep_mode(),
         )
     elif a2a_backend.is_flashinfer():
         return FlashinferDispatcher(

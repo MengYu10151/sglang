@@ -32,6 +32,13 @@ from sglang.srt.layers.moe.token_dispatcher.moriep import (
     MoriEPNormalCombineInput,
     MoriEPNormalDispatchOutput,
 )
+from sglang.srt.layers.moe.token_dispatcher.ncclep import (
+    NcclEpDispatcher,
+    NcclEpHighThroughputCombineInput,
+    NcclEpHighThroughputDispatchOutput,
+    NcclEpLowLatencyCombineInput,
+    NcclEpLowLatencyDispatchOutput,
+)
 from sglang.srt.layers.moe.token_dispatcher.nixl import (
     NixlEPCombineInput,
     NixlEPDispatcher,
@@ -62,6 +69,11 @@ __all__ = [
     "MoriEPLLDispatchOutput",
     "MoriEPLLCombineInput",
     "MoriEPDispatcher",
+    "NcclEpDispatcher",
+    "NcclEpHighThroughputDispatchOutput",
+    "NcclEpHighThroughputCombineInput",
+    "NcclEpLowLatencyDispatchOutput",
+    "NcclEpLowLatencyCombineInput",
     "NixlEPCombineInput",
     "NixlEPDispatchOutput",
     "NixlEPDispatcher",

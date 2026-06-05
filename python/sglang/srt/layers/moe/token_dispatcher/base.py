@@ -27,6 +27,10 @@ if TYPE_CHECKING:
         DeepEPNormalDispatchOutput,
         FlashinferCombineInput,
         FlashinferDispatchOutput,
+        NcclEpHighThroughputDispatchOutput,
+        NcclEpLowLatencyDispatchOutput,
+        NcclEpHighThroughputCombineInput,
+        NcclEpLowLatencyCombineInput,
         StandardCombineInput,
         StandardDispatchOutput,
     )
@@ -157,6 +161,24 @@ class DispatchOutputChecker:
     ) -> TypeGuard[FlashinferDispatchOutput]:
         return dispatch_output.format.is_flashinfer()
 
+    @staticmethod
+    def format_is_ncclep_high_throughput(
+        dispatch_output: DispatchOutput,
+    ) -> TypeGuard[NcclEpHighThroughputDispatchOutput]:
+        return dispatch_output.format.is_ncclep_high_throughput()
+
+    @staticmethod
+    def format_is_ncclep_low_latency(
+        dispatch_output: DispatchOutput,
+    ) -> TypeGuard[NcclEpLowLatencyDispatchOutput]:
+        return dispatch_output.format.is_ncclep_low_latency()
+
+    @staticmethod
+    def format_is_ncclep(
+        dispatch_output: DispatchOutput,
+    ) -> TypeGuard[Union[NcclEpHighThroughputDispatchOutput, NcclEpLowLatencyDispatchOutput]]:
+        return dispatch_output.format.is_ncclep()
+
 
 class DispatchOutputFormat(Enum):
 
@@ -164,6 +186,8 @@ class DispatchOutputFormat(Enum):
     DEEPEP_NORMAL = "deepep_normal"
     DEEPEP_LL = "deepep_ll"
     FLASHINFER = "flashinfer"
+    NCCL_EP_HT = "ncclep_high_throughput"
+    NCCL_EP_LL = "ncclep_low_latency"
 
     def is_standard(self) -> bool:
         return self == DispatchOutputFormat.STANDARD
@@ -182,6 +206,18 @@ class DispatchOutputFormat(Enum):
 
     def is_flashinfer(self) -> bool:
         return self == DispatchOutputFormat.FLASHINFER
+
+    def is_ncclep_high_throughput(self) -> bool:
+        return self == DispatchOutputFormat.NCCL_EP_HT
+
+    def is_ncclep_low_latency(self) -> bool:
+        return self == DispatchOutputFormat.NCCL_EP_LL
+
+    def is_ncclep(self) -> bool:
+        return self in [
+            DispatchOutputFormat.NCCL_EP_HT,
+            DispatchOutputFormat.NCCL_EP_LL,
+        ]
 
 
 @runtime_checkable
@@ -231,12 +267,35 @@ class CombineInputChecker:
     ) -> TypeGuard[FlashinferCombineInput]:
         return combine_input.format == CombineInputFormat.FLASHINFER
 
+    @staticmethod
+    def format_is_ncclep_high_throughput(
+        combine_input: CombineInput,
+    ) -> TypeGuard[NcclEpHighThroughputCombineInput]:
+        return combine_input.format == CombineInputFormat.NCCL_EP_HT
+
+    @staticmethod
+    def format_is_ncclep_low_latency(
+        combine_input: CombineInput,
+    ) -> TypeGuard[NcclEpLowLatencyCombineInput]:
+        return combine_input.format == CombineInputFormat.NCCL_EP_LL
+
+    @staticmethod
+    def format_is_ncclep(
+        combine_input: CombineInput,
+    ) -> TypeGuard[Union[NcclEpHighThroughputCombineInput, NcclEpLowLatencyCombineInput]]:
+        return combine_input.format in [
+            CombineInputFormat.NCCL_EP_HT,
+            CombineInputFormat.NCCL_EP_LL,
+        ]
+
 
 class CombineInputFormat(Enum):
     STANDARD = "standard"
     DEEPEP_NORMAL = "deepep_normal"
     DEEPEP_LL = "deepep_ll"
     FLASHINFER = "flashinfer"
+    NCCL_EP_HT = "ncclep_high_throughput"
+    NCCL_EP_LL = "ncclep_low_latency"
 
 
 @runtime_checkable

@@ -36,6 +36,7 @@ class MoeA2ABackend(Enum):
     ASCEND_FUSEEP = "ascend_fuseep"
     FLASHINFER = "flashinfer"
     MEGAMOE = "megamoe"
+    NCCL_EP = "ncclep"
     CUSTOMIZED = "customized"
 
     @classmethod
@@ -70,6 +71,9 @@ class MoeA2ABackend(Enum):
 
     def is_megamoe(self):
         return self == MoeA2ABackend.MEGAMOE
+
+    def is_ncclep(self):
+        return self == MoeA2ABackend.NCCL_EP
 
     def is_customized(self):
         return self == MoeA2ABackend.CUSTOMIZED
@@ -134,6 +138,18 @@ class MoeRunnerBackend(Enum):
 
     def is_aiter(self):
         return self == MoeRunnerBackend.AITER
+
+
+class NcclEpMode(Enum):
+
+    HIGH_THROUGHPUT = "high_throughput"
+    LOW_LATENCY = "low_latency"
+
+    def is_high_throughput(self) -> bool:
+        return self == NcclEpMode.HIGH_THROUGHPUT
+
+    def is_low_latency(self) -> bool:
+        return self == NcclEpMode.LOW_LATENCY
 
 
 class DeepEPMode(Enum):
@@ -242,6 +258,7 @@ MOE_RUNNER_BACKEND: Optional[MoeRunnerBackend] = None
 SPECULATIVE_MOE_RUNNER_BACKEND: Optional[MoeRunnerBackend] = None
 SPECULATIVE_MOE_A2A_BACKEND: Optional[MoeA2ABackend] = None
 DEEPEP_MODE: Optional[DeepEPMode] = None
+NCCLEP_MODE: Optional[NcclEpMode] = None
 IS_TBO_ENABLED: Optional[bool] = None
 IS_SBO_ENABLED: Optional[bool] = None
 TBO_TOKEN_DISTRIBUTION_THRESHOLD: Optional[float] = None
@@ -256,6 +273,7 @@ def initialize_moe_config(server_args: ServerArgs):
     global SPECULATIVE_MOE_RUNNER_BACKEND
     global SPECULATIVE_MOE_A2A_BACKEND
     global DEEPEP_MODE
+    global NCCLEP_MODE
     global DEEPEP_CONFIG
     global IS_TBO_ENABLED
     global IS_SBO_ENABLED
@@ -276,6 +294,7 @@ def initialize_moe_config(server_args: ServerArgs):
         else MOE_A2A_BACKEND
     )
     DEEPEP_MODE = DeepEPMode(server_args.deepep_mode)
+    NCCLEP_MODE = NcclEpMode(server_args.ncclep_mode)
     DEEPEP_CONFIG = server_args.deepep_config or ""
     IS_TBO_ENABLED = server_args.enable_two_batch_overlap
     IS_SBO_ENABLED = server_args.enable_single_batch_overlap
@@ -323,6 +342,14 @@ def get_speculative_moe_a2a_backend() -> MoeA2ABackend:
         )
         SPECULATIVE_MOE_A2A_BACKEND = MoeA2ABackend.NONE
     return SPECULATIVE_MOE_A2A_BACKEND
+
+
+def get_ncclep_mode() -> NcclEpMode:
+    global NCCLEP_MODE
+    if NCCLEP_MODE is None:
+        logger.warning("NCCLEP_MODE is not initialized, using high_throughput mode")
+        NCCLEP_MODE = NcclEpMode.HIGH_THROUGHPUT
+    return NCCLEP_MODE
 
 
 def get_deepep_mode() -> DeepEPMode:

@@ -1,10 +1,12 @@
 from sglang.srt.layers.moe.moe_runner import MoeRunner, MoeRunnerConfig
 from sglang.srt.layers.moe.utils import (
     DeepEPMode,
+    NcclEpMode,
     MoeA2ABackend,
     MoeRunnerBackend,
     get_deepep_config,
     get_deepep_mode,
+    get_ncclep_mode,
     get_moe_a2a_backend,
     get_moe_runner_backend,
     get_tbo_token_distribution_threshold,
@@ -17,6 +19,7 @@ from sglang.srt.layers.moe.utils import (
 
 __all__ = [
     "DeepEPMode",
+    "NcclEpMode",
     "MoeA2ABackend",
     "MoeRunner",
     "MoeRunnerConfig",
@@ -25,6 +28,7 @@ __all__ = [
     "get_moe_a2a_backend",
     "get_moe_runner_backend",
     "get_deepep_mode",
+    "get_ncclep_mode",
     "should_skip_post_experts_all_reduce",
     "should_use_dp_reduce_scatterv",
     "should_use_flashinfer_cutlass_moe_fp4_allgather",
