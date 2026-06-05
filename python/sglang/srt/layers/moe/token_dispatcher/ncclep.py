@@ -591,11 +591,18 @@ class _NcclEpLowLatencyImpl(_NcclEpImplBase):
             dtype=torch.float8_e4m3fn,
             device="cuda",
         )
+        # NCCL_EP LL writes scales in scale-major memory order:
+        # [local_expert, scale_block, slot]. Expose a logical
+        # [local_expert, slot, scale_block] view to DeepGEMM.
         self._output_scales = torch.empty(
-            scale_shape,
+            (
+                self.num_local_experts,
+                self.hidden_size // _SCALE_BLOCK_SIZE,
+                max_slots,
+            ),
             dtype=torch.float32,
             device="cuda",
-        )
+        ).transpose(1, 2)
         if self._recv_count is None or tuple(self._recv_count.shape) != count_shape:
             self._recv_count = torch.zeros(count_shape, dtype=torch.int32, device="cuda")
         if tuple(self._output_tokens.shape) != token_shape:
