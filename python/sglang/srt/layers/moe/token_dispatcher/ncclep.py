@@ -141,12 +141,10 @@ class NcclEpBuffer:
             )
 
         world_size = dist.get_world_size(group)
-        if mode.is_high_throughput():
-            max_recv_tokens_per_rank = (
-                num_max_dispatch_tokens_per_rank * num_local_experts
-            )
-        else:
-            max_recv_tokens_per_rank = num_max_dispatch_tokens_per_rank * world_size
+        # NCCL_EP HT FLAT receives at most one row from each source rank for a
+        # dispatched token. Match the native Python UT / README group-config
+        # budget: max_recv_tokens_per_rank = nRanks * max_dispatch_tokens_per_rank.
+        max_recv_tokens_per_rank = num_max_dispatch_tokens_per_rank * world_size
         key = (
             id(group),
             hidden_size,
@@ -220,8 +218,6 @@ class _NcclEpImplBase:
 
     @property
     def max_recv_tokens_per_rank(self) -> int:
-        if self.mode.is_high_throughput():
-            return self.num_max_dispatch_tokens_per_rank * self.num_local_experts
         return self.num_max_dispatch_tokens_per_rank * self.world_size
 
     def _get_ep(self):
@@ -316,7 +312,10 @@ class _NcclEpHighThroughputImpl(_NcclEpImplBase):
         self._ensure_buffers(max_recv_tokens)
         self._expert_counters.zero_()
         self._recv_total_counter.zero_()
+        self._recv_tokens.zero_()
+        self._recv_scales.zero_()
         self._recv_topk_ids.fill_(-1)
+        self._recv_topk_weights.zero_()
 
         self._destroy_handle()
         layout_info = LayoutInfo(expert_counters=Tensor(self._expert_counters))
@@ -348,7 +347,10 @@ class _NcclEpHighThroughputImpl(_NcclEpImplBase):
         reported_recv = int(self._expert_counters.sum().item())
         valid_rows = (self._recv_topk_ids >= 0).any(dim=1)
         inferred_recv = int(valid_rows.sum().item())
-        self._num_recv_tokens = min(max(reported_recv, inferred_recv), max_recv_tokens)
+        # NCCL_EP HT FLAT uses the static max_recv_tokens_per_rank slot space
+        # in the handle metadata. Keep the full slot space through local MoE
+        # and combine; invalid slots remain masked by topk_idx == -1.
+        self._num_recv_tokens = max_recv_tokens
 
         recv_topk_ids = self._recv_topk_ids[: self._num_recv_tokens]
         recv_topk_weights = self._recv_topk_weights[: self._num_recv_tokens]

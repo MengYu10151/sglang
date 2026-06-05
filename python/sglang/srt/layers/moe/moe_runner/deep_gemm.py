@@ -1019,7 +1019,9 @@ def pre_permute_ncclep_high_throughput_to_deep_gemm(
     running_state["topk_ids"] = topk_ids
     running_state["topk_weights"] = topk_weights
 
-    input_tensor = torch.empty(
+    # NCCL_EP HT counts are padded for DeepGEMM BLOCK_E alignment. ep_scatter
+    # only writes real routed rows, so initialize the padded rows to neutral data.
+    input_tensor = torch.zeros(
         (all_tokens, K), device=hidden_states.device, dtype=hidden_states.dtype
     )
     if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
@@ -1029,7 +1031,7 @@ def pre_permute_ncclep_high_throughput_to_deep_gemm(
             dtype=torch.int,
         ).transpose(0, 1)
     else:
-        input_tensor_scale = torch.empty(
+        input_tensor_scale = torch.zeros(
             (all_tokens, K // 128), device=hidden_states.device, dtype=torch.float32
         )
     m_indices = torch.empty(all_tokens, device=hidden_states.device, dtype=torch.int32)
