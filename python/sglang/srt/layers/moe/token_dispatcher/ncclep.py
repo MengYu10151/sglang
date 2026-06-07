@@ -20,7 +20,11 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
     DispatchOutputFormat,
 )
 from sglang.srt.layers.moe.topk import TopKOutput
-from sglang.srt.layers.moe.utils import NcclEpMode
+from sglang.srt.layers.moe.utils import (
+    NcclEpMode,
+    NcclEpOutputDtype,
+    get_ncclep_output_dtype,
+)
 from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
 
 logger = logging.getLogger(__name__)
@@ -133,7 +137,7 @@ except (ImportError, OSError) as exc:
 
 class NcclEpHighThroughputDispatchOutput(NamedTuple):
     hidden_states: torch.Tensor
-    hidden_states_scale: torch.Tensor
+    hidden_states_scale: Optional[torch.Tensor]
     topk_ids: torch.Tensor
     topk_weights: torch.Tensor
     num_recv_tokens_per_expert: List[int]
@@ -145,7 +149,7 @@ class NcclEpHighThroughputDispatchOutput(NamedTuple):
 
 class NcclEpLowLatencyDispatchOutput(NamedTuple):
     hidden_states: torch.Tensor
-    hidden_states_scale: torch.Tensor
+    hidden_states_scale: Optional[torch.Tensor]
     topk_ids: torch.Tensor
     topk_weights: torch.Tensor
     masked_m: torch.Tensor
@@ -216,6 +220,7 @@ class NcclEpBuffer:
         group: dist.ProcessGroup,
         hidden_size: int,
         mode: NcclEpMode,
+        output_dtype: NcclEpOutputDtype,
         num_max_dispatch_tokens_per_rank: int,
         num_experts: int,
         num_local_experts: int,
@@ -246,7 +251,10 @@ class NcclEpBuffer:
                     f"at {_LL_MAX_DISPATCH_TOKENS_PER_RANK}, got "
                     f"{num_max_dispatch_tokens_per_rank}."
                 )
-            if hidden_size % _LL_FP8_SCALE_ALIGNMENT != 0:
+            if (
+                output_dtype == NcclEpOutputDtype.FP8
+                and hidden_size % _LL_FP8_SCALE_ALIGNMENT != 0
+            ):
                 raise ValueError(
                     "NCCL_EP low_latency FP8 dispatch with output scales requires "
                     f"hidden_size multiple of {_LL_FP8_SCALE_ALIGNMENT}, got {hidden_size}."
@@ -260,6 +268,7 @@ class NcclEpBuffer:
             id(group),
             hidden_size,
             mode.value,
+            output_dtype.value,
             num_max_dispatch_tokens_per_rank,
             max_recv_tokens_per_rank,
             num_experts,
@@ -286,10 +295,11 @@ class NcclEpBuffer:
         cls._ep_group = Group.create(cls._comm, config)
         cls._group_key = key
         logger.info(
-            "Initialized NCCL_EP group: mode=%s world_size=%s num_experts=%s "
+            "Initialized NCCL_EP group: mode=%s output_dtype=%s world_size=%s num_experts=%s "
             "num_local_experts=%s max_dispatch_tokens_per_rank=%s "
             "max_recv_tokens_per_rank=%s hidden_size=%s num_qp_per_rank=%s",
             mode.value,
+            output_dtype.value,
             world_size,
             num_experts,
             num_local_experts,
@@ -361,6 +371,7 @@ class _NcclEpImplBase:
         num_local_experts: int,
         hidden_size: int,
         mode: NcclEpMode,
+        output_dtype: NcclEpOutputDtype,
         num_max_dispatch_tokens_per_rank: int,
     ):
         self.group = group
@@ -369,6 +380,7 @@ class _NcclEpImplBase:
         self.num_local_experts = num_local_experts
         self.hidden_size = hidden_size
         self.mode = mode
+        self.output_dtype = output_dtype
         self.num_max_dispatch_tokens_per_rank = num_max_dispatch_tokens_per_rank
         self.world_size = dist.get_world_size(group)
         self.rank = dist.get_rank(group)
@@ -383,10 +395,19 @@ class _NcclEpImplBase:
             self.group,
             self.hidden_size,
             self.mode,
+            self.output_dtype,
             self.num_max_dispatch_tokens_per_rank,
             self.num_experts,
             self.num_local_experts,
         )
+
+    def set_output_dtype(self, output_dtype: NcclEpOutputDtype) -> None:
+        if self.output_dtype != output_dtype:
+            self._destroy_handle()
+            self.output_dtype = output_dtype
+
+    def _uses_fp8_dispatch_output(self) -> bool:
+        return self.output_dtype == NcclEpOutputDtype.FP8
 
     def _destroy_handle(self) -> None:
         if self._handle is not None:
@@ -408,7 +429,8 @@ class _NcclEpImplBase:
             )
         if self.hidden_size % _SCALE_BLOCK_SIZE != 0:
             raise ValueError(
-                f"NCCL_EP FP8 dispatch requires hidden_size multiple of {_SCALE_BLOCK_SIZE}, got {self.hidden_size}"
+                "NCCL_EP dispatch requires hidden_size multiple of "
+                f"{_SCALE_BLOCK_SIZE}, got {self.hidden_size}"
             )
         if topk_ids.shape[1] != self.router_topk:
             raise ValueError(
@@ -432,22 +454,35 @@ class _NcclEpHighThroughputImpl(_NcclEpImplBase):
         self._num_recv_tokens = 0
         self._num_input_tokens = 0
 
+    def set_output_dtype(self, output_dtype: NcclEpOutputDtype) -> None:
+        if self.output_dtype != output_dtype:
+            super().set_output_dtype(output_dtype)
+            self._recv_tokens = None
+            self._recv_scales = None
+
     def _ensure_buffers(self, max_recv_tokens: int) -> None:
+        token_dtype = (
+            torch.float8_e4m3fn if self._uses_fp8_dispatch_output() else torch.bfloat16
+        )
         if (
             self._recv_tokens is not None
             and self._recv_tokens.shape[0] >= max_recv_tokens
+            and self._recv_tokens.dtype == token_dtype
         ):
             return
         self._recv_tokens = torch.empty(
             (max_recv_tokens, self.hidden_size),
-            dtype=torch.float8_e4m3fn,
+            dtype=token_dtype,
             device="cuda",
         )
-        self._recv_scales = torch.empty(
-            (max_recv_tokens, self.hidden_size // _SCALE_BLOCK_SIZE),
-            dtype=torch.float32,
-            device="cuda",
-        )
+        if self._uses_fp8_dispatch_output():
+            self._recv_scales = torch.empty(
+                (max_recv_tokens, self.hidden_size // _SCALE_BLOCK_SIZE),
+                dtype=torch.float32,
+                device="cuda",
+            )
+        else:
+            self._recv_scales = None
         self._recv_topk_ids = torch.empty(
             (max_recv_tokens, self.router_topk), dtype=torch.int64, device="cuda"
         )
@@ -463,9 +498,13 @@ class _NcclEpHighThroughputImpl(_NcclEpImplBase):
         topk_weights = topk_output.topk_weights
         topk_ids = topk_output.topk_ids.to(torch.int64)
         self._validate_common(hidden_states, topk_ids)
-        q_hidden_states, hidden_states_scale = _quantize_for_ncclep_dispatch(
-            hidden_states
-        )
+        if self._uses_fp8_dispatch_output():
+            q_hidden_states, hidden_states_scale = _quantize_for_ncclep_dispatch(
+                hidden_states
+            )
+        else:
+            q_hidden_states = hidden_states
+            hidden_states_scale = None
 
         _, ep_group = self._get_ep()
         num_tokens = hidden_states.shape[0]
@@ -475,7 +514,8 @@ class _NcclEpHighThroughputImpl(_NcclEpImplBase):
         self._expert_counters.zero_()
         self._recv_total_counter.zero_()
         self._recv_tokens.zero_()
-        self._recv_scales.zero_()
+        if self._recv_scales is not None:
+            self._recv_scales.zero_()
         self._recv_topk_ids.fill_(-1)
         self._recv_topk_weights.zero_()
 
@@ -487,18 +527,28 @@ class _NcclEpHighThroughputImpl(_NcclEpImplBase):
             stream=_stream(),
         )
 
+        dispatch_inputs = DispatchInputs(
+            tokens=Tensor(q_hidden_states),
+            topk_weights=Tensor(topk_weights),
+            **(
+                {"scales": Tensor(hidden_states_scale)}
+                if hidden_states_scale is not None
+                else {}
+            ),
+        )
+        dispatch_outputs = DispatchOutputs(
+            tokens=Tensor(self._recv_tokens),
+            topk_weights=Tensor(self._recv_topk_weights),
+            topk_idx=Tensor(self._recv_topk_ids),
+            **(
+                {"scales": Tensor(self._recv_scales)}
+                if self._recv_scales is not None
+                else {}
+            ),
+        )
         self._handle.dispatch(
-            DispatchInputs(
-                tokens=Tensor(q_hidden_states),
-                topk_weights=Tensor(topk_weights),
-                scales=Tensor(hidden_states_scale),
-            ),
-            DispatchOutputs(
-                tokens=Tensor(self._recv_tokens),
-                topk_weights=Tensor(self._recv_topk_weights),
-                topk_idx=Tensor(self._recv_topk_ids),
-                scales=Tensor(self._recv_scales),
-            ),
+            dispatch_inputs,
+            dispatch_outputs,
             layout_info=layout_info,
             config=DispatchConfig(round_scales=0, pass_direction=PassDir.FWD),
             stream=_stream(),
@@ -544,7 +594,11 @@ class _NcclEpHighThroughputImpl(_NcclEpImplBase):
 
         return NcclEpHighThroughputDispatchOutput(
             self._recv_tokens[: self._num_recv_tokens],
-            self._recv_scales[: self._num_recv_tokens],
+            (
+                self._recv_scales[: self._num_recv_tokens]
+                if self._recv_scales is not None
+                else None
+            ),
             local_topk_ids,
             recv_topk_weights,
             counts,
@@ -575,6 +629,12 @@ class _NcclEpLowLatencyImpl(_NcclEpImplBase):
         self._output_scales: Optional[torch.Tensor] = None
         self._recv_count: Optional[torch.Tensor] = None
 
+    def set_output_dtype(self, output_dtype: NcclEpOutputDtype) -> None:
+        if self.output_dtype != output_dtype:
+            super().set_output_dtype(output_dtype)
+            self._output_tokens = None
+            self._output_scales = None
+
     def _ensure_buffers(self) -> None:
         max_slots = self.max_recv_tokens_per_rank
         token_shape = (self.num_local_experts, max_slots, self.hidden_size)
@@ -588,21 +648,28 @@ class _NcclEpLowLatencyImpl(_NcclEpImplBase):
         # outputs cannot be treated as reusable dispatcher-owned buffers.
         self._output_tokens = torch.empty(
             token_shape,
-            dtype=torch.float8_e4m3fn,
+            dtype=(
+                torch.float8_e4m3fn
+                if self._uses_fp8_dispatch_output()
+                else torch.bfloat16
+            ),
             device="cuda",
         )
-        # NCCL_EP LL writes scales in scale-major memory order:
-        # [local_expert, scale_block, slot]. Expose a logical
-        # [local_expert, slot, scale_block] view to DeepGEMM.
-        self._output_scales = torch.empty(
-            (
-                self.num_local_experts,
-                self.hidden_size // _SCALE_BLOCK_SIZE,
-                max_slots,
-            ),
-            dtype=torch.float32,
-            device="cuda",
-        ).transpose(1, 2)
+        if self._uses_fp8_dispatch_output():
+            # NCCL_EP LL writes scales in scale-major memory order:
+            # [local_expert, scale_block, slot]. Expose a logical
+            # [local_expert, slot, scale_block] view to DeepGEMM.
+            self._output_scales = torch.empty(
+                (
+                    self.num_local_experts,
+                    self.hidden_size // _SCALE_BLOCK_SIZE,
+                    max_slots,
+                ),
+                dtype=torch.float32,
+                device="cuda",
+            ).transpose(1, 2)
+        else:
+            self._output_scales = None
         if self._recv_count is None or tuple(self._recv_count.shape) != count_shape:
             self._recv_count = torch.zeros(count_shape, dtype=torch.int32, device="cuda")
         if tuple(self._output_tokens.shape) != token_shape:
@@ -610,7 +677,10 @@ class _NcclEpLowLatencyImpl(_NcclEpImplBase):
                 "Failed to allocate NCCL_EP low_latency output token buffer: "
                 f"got {tuple(self._output_tokens.shape)}, expected {token_shape}"
             )
-        if tuple(self._output_scales.shape) != scale_shape:
+        if (
+            self._output_scales is not None
+            and tuple(self._output_scales.shape) != scale_shape
+        ):
             raise RuntimeError(
                 "Failed to allocate NCCL_EP low_latency output scale buffer: "
                 f"got {tuple(self._output_scales.shape)}, expected {scale_shape}"
@@ -625,7 +695,8 @@ class _NcclEpLowLatencyImpl(_NcclEpImplBase):
         self._ensure_buffers()
         self._recv_count.zero_()
         self._output_tokens.zero_()
-        self._output_scales.zero_()
+        if self._output_scales is not None:
+            self._output_scales.zero_()
 
         self._destroy_handle()
         self._handle = ep_group.create_handle(
@@ -634,17 +705,22 @@ class _NcclEpLowLatencyImpl(_NcclEpImplBase):
             stream=_stream(),
         )
         output_tokens = Tensor(self._output_tokens)
-        output_scales = Tensor(self._output_scales)
-        if output_tokens.ndim != 3 or output_scales.ndim != 3:
+        output_scales = (
+            Tensor(self._output_scales) if self._output_scales is not None else None
+        )
+        if output_tokens.ndim != 3 or (
+            output_scales is not None and output_scales.ndim != 3
+        ):
             raise RuntimeError(
                 "NCCL_EP low_latency dispatch expects 3D output tensors, got "
-                f"tokens={output_tokens.sizes}, scales={output_scales.sizes}"
+                "tokens=%s, scales=%s"
+                % (output_tokens.sizes, getattr(output_scales, "sizes", None))
             )
         layout_info = LayoutInfo(expert_counters=Tensor(self._recv_count))
         dispatch_inputs = DispatchInputs(tokens=Tensor(hidden_states))
         dispatch_outputs = DispatchOutputs(
             tokens=output_tokens,
-            scales=output_scales,
+            **({"scales": output_scales} if output_scales is not None else {}),
         )
         dispatch_config = DispatchConfig(round_scales=0)
         self._handle.dispatch(
@@ -714,9 +790,12 @@ class NcclEpDispatcher(BaseDispatcher):
         super().__init__()
         if params_dtype != torch.bfloat16:
             raise NotImplementedError(
-                f"NCCL_EP FP8 dispatch adapter currently expects BF16 model activations, got {params_dtype}"
+                "NCCL_EP dispatch adapter currently expects BF16 model activations, "
+                f"got {params_dtype}"
             )
         self.ncclep_mode = ncclep_mode
+        self.quant_config = {}
+        self.output_dtype = get_ncclep_output_dtype(self)
         self.num_max_dispatch_tokens_per_rank = (
             envs.SGLANG_NCCL_EP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
         )
@@ -726,6 +805,7 @@ class NcclEpDispatcher(BaseDispatcher):
             num_experts=num_experts,
             num_local_experts=num_local_experts,
             hidden_size=hidden_size,
+            output_dtype=self.output_dtype,
             num_max_dispatch_tokens_per_rank=self.num_max_dispatch_tokens_per_rank,
         )
         if ncclep_mode.is_high_throughput():
@@ -735,6 +815,11 @@ class NcclEpDispatcher(BaseDispatcher):
         else:
             raise ValueError(f"Unsupported NCCL_EP mode: {ncclep_mode}")
         self._stage = _Stage.INITIAL
+
+    def set_quant_config(self, quant_config: dict) -> None:
+        self.quant_config = quant_config
+        self.output_dtype = get_ncclep_output_dtype(self)
+        self._impl.set_output_dtype(self.output_dtype)
 
     def dispatch(
         self, hidden_states: torch.Tensor, topk_output: TopKOutput

@@ -637,6 +637,7 @@ class ServerArgs:
     enable_aiter_allreduce_fusion: bool = False
     deepep_mode: Literal["auto", "normal", "low_latency"] = "auto"
     ncclep_mode: Literal["high_throughput", "low_latency"] = "high_throughput"
+    ncclep_dispatcher_output_dtype: Literal["auto", "bf16", "fp8"] = "auto"
     deepep_dispatcher_output_dtype: Literal["auto", "bf16", "fp8", "int8", "nvfp4"] = (
         "auto"
     )
@@ -5941,6 +5942,16 @@ class ServerArgs:
             choices=["high_throughput", "low_latency"],
             default=ServerArgs.ncclep_mode,
             help="Select NCCL_EP mode. Use high_throughput for prefill-style large-token dispatch and low_latency for decode-style small-token dispatch.",
+        )
+        parser.add_argument(
+            "--ncclep-dispatcher-output-dtype",
+            type=str,
+            choices=["auto", "bf16", "fp8"],
+            default=ServerArgs.ncclep_dispatcher_output_dtype,
+            help=(
+                "Select the NCCL_EP dispatcher output dtype. auto maps DeepGEMM "
+                "to fp8 activation+scales and Triton to bf16 activation without scales."
+            ),
         )
         parser.add_argument(
             "--deepep-mode",

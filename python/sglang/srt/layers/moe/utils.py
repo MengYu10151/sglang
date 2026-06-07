@@ -152,6 +152,18 @@ class NcclEpMode(Enum):
         return self == NcclEpMode.LOW_LATENCY
 
 
+class NcclEpOutputDtype(Enum):
+    """
+    Describes the dispatch output data type for NCCL_EP.
+
+    - BF16: dispatch hidden states in bf16, without activation scales.
+    - FP8: dispatch hidden states in fp8, with activation scales.
+    """
+
+    BF16 = "bf16"
+    FP8 = "fp8"
+
+
 class DeepEPMode(Enum):
 
     NORMAL = "normal"
@@ -251,6 +263,40 @@ def get_deepep_output_dtype(self) -> DeepEPOutputDtype:
 
     # 6. Default → FP8
     return DeepEPOutputDtype.FP8
+
+
+def get_ncclep_output_dtype(self) -> NcclEpOutputDtype:
+    """
+    Automatically choose the dispatch output dtype for NCCL_EP.
+
+    The decision follows several checks in priority order:
+    0. Parse server argument.
+    1. Parse quant config.
+    2. DeepGEMM expects FP8 activation + scales for the validated DSv4 path.
+    3. Triton consumes BF16 activation without dispatcher-provided scales.
+    """
+
+    server_args = get_global_server_args()
+    if server_args and server_args.ncclep_dispatcher_output_dtype != "auto":
+        return NcclEpOutputDtype(server_args.ncclep_dispatcher_output_dtype)
+
+    if getattr(self, "quant_config", None) is not None:
+        dispatcher_output_dtype = self.quant_config.get("dispatcher_output_dtype", None)
+        if dispatcher_output_dtype is not None:
+            return NcclEpOutputDtype(dispatcher_output_dtype)
+
+    runner_backend = get_moe_runner_backend()
+    if runner_backend.is_deep_gemm():
+        return NcclEpOutputDtype.FP8
+    if runner_backend.is_triton():
+        return NcclEpOutputDtype.BF16
+
+    raise ValueError(
+        "NCCL_EP auto dispatcher output dtype only supports deep_gemm and triton "
+        f"runner backends for now, got {runner_backend.value}. Set "
+        "--ncclep-dispatcher-output-dtype explicitly only after adding a matching "
+        "NCCL_EP runner adapter."
+    )
 
 
 MOE_A2A_BACKEND: Optional[MoeA2ABackend] = None

@@ -953,6 +953,12 @@ def pre_permute_ncclep_low_latency_to_deep_gemm(
     hidden_states, hidden_states_scale, topk_ids, topk_weights, masked_m, expected_m = (
         dispatch_output
     )
+    if hidden_states_scale is None:
+        raise RuntimeError(
+            "NCCL_EP low_latency -> DeepGEMM requires FP8 dispatch output "
+            "with activation scales. Use --ncclep-dispatcher-output-dtype fp8 "
+            "or select a BF16 runner such as triton."
+        )
     running_state["topk_ids"] = topk_ids
     running_state["topk_weights"] = topk_weights
     running_state["hidden_states_shape"] = hidden_states.shape
@@ -1001,6 +1007,12 @@ def pre_permute_ncclep_high_throughput_to_deep_gemm(
         topk_weights,
         num_recv_tokens_per_expert,
     ) = dispatch_output
+    if hidden_states_scale is None:
+        raise RuntimeError(
+            "NCCL_EP high_throughput -> DeepGEMM requires FP8 dispatch output "
+            "with activation scales. Use --ncclep-dispatcher-output-dtype fp8 "
+            "or select a BF16 runner such as triton."
+        )
     assert runner_config.activation == "silu"
 
     # ep_scatter groups tokens into expert slabs aligned to BLOCK_E=128.
