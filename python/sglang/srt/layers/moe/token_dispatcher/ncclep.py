@@ -32,7 +32,6 @@ logger = logging.getLogger(__name__)
 _SCALE_BLOCK_SIZE = 128
 _LL_FP8_SCALE_ALIGNMENT = 512
 _LL_MAX_TOPK = 9
-_LL_MAX_DISPATCH_TOKENS_PER_RANK = 1024
 _ncclep_import_error: Optional[BaseException] = None
 
 
@@ -245,12 +244,6 @@ class NcclEpBuffer:
                 f"{num_max_dispatch_tokens_per_rank}"
             )
         if mode.is_low_latency():
-            if num_max_dispatch_tokens_per_rank > _LL_MAX_DISPATCH_TOKENS_PER_RANK:
-                raise ValueError(
-                    "NCCL_EP low_latency adapter caps max_dispatch_tokens_per_rank "
-                    f"at {_LL_MAX_DISPATCH_TOKENS_PER_RANK}, got "
-                    f"{num_max_dispatch_tokens_per_rank}."
-                )
             if (
                 output_dtype == NcclEpOutputDtype.FP8
                 and hidden_size % _LL_FP8_SCALE_ALIGNMENT != 0
