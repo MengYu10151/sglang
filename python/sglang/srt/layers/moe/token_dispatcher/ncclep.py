@@ -487,6 +487,17 @@ class _NcclEpHighThroughputImpl(_NcclEpImplBase):
         )
         self._recv_total_counter = torch.zeros(1, dtype=torch.int32, device="cuda")
 
+    def _bind_handle(self, ep_group, topk_ids: torch.Tensor) -> None:
+        topk_tensor = Tensor(topk_ids)
+        if self._handle is None:
+            self._handle = ep_group.create_handle(
+                Layout.FLAT,
+                topk_tensor,
+                stream=_stream(),
+            )
+        else:
+            self._handle.update(topk_tensor, stream=_stream())
+
     def dispatch(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
         topk_weights = topk_output.topk_weights
         topk_ids = topk_output.topk_ids.to(torch.int64)
@@ -512,13 +523,8 @@ class _NcclEpHighThroughputImpl(_NcclEpImplBase):
         self._recv_topk_ids.fill_(-1)
         self._recv_topk_weights.zero_()
 
-        self._destroy_handle()
         layout_info = LayoutInfo(expert_counters=Tensor(self._expert_counters))
-        self._handle = ep_group.create_handle(
-            Layout.FLAT,
-            Tensor(topk_ids),
-            stream=_stream(),
-        )
+        self._bind_handle(ep_group, topk_ids)
 
         dispatch_inputs = DispatchInputs(
             tokens=Tensor(q_hidden_states),
@@ -599,6 +605,8 @@ class _NcclEpHighThroughputImpl(_NcclEpImplBase):
 
     def combine(self, combine_input: NcclEpHighThroughputCombineInput) -> torch.Tensor:
         output = combine_input.hidden_states
+        if self._handle is None:
+            raise RuntimeError("NCCL_EP HT combine called before dispatch handle init")
         combined = torch.empty(
             (self._num_input_tokens, self.hidden_size),
             dtype=torch.bfloat16,
@@ -611,7 +619,6 @@ class _NcclEpHighThroughputImpl(_NcclEpImplBase):
         )
         self._handle.complete(stream=_stream())
         torch.cuda.synchronize()
-        self._destroy_handle()
         return combined
 
 
