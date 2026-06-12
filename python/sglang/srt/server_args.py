@@ -234,6 +234,7 @@ MOE_A2A_BACKEND_CHOICES = [
     "flashinfer",
     "megamoe",
     "ncclep",
+    "epv2",
 ]
 
 FP8_GEMM_RUNNER_BACKEND_CHOICES = [
@@ -629,6 +630,7 @@ class ServerArgs:
         "flashinfer",
         "megamoe",
         "ncclep",
+        "epv2",
     ] = "none"
     moe_runner_backend: str = "auto"
     flashinfer_mxfp4_moe_precision: Literal["default", "bf16"] = "default"
@@ -638,6 +640,7 @@ class ServerArgs:
     deepep_mode: Literal["auto", "normal", "low_latency"] = "auto"
     ncclep_mode: Literal["high_throughput", "low_latency"] = "high_throughput"
     ncclep_dispatcher_output_dtype: Literal["auto", "bf16", "fp8"] = "auto"
+    epv2_dispatcher_output_dtype: Literal["auto", "bf16", "fp8"] = "auto"
     deepep_dispatcher_output_dtype: Literal["auto", "bf16", "fp8", "int8", "nvfp4"] = (
         "auto"
     )
@@ -3479,6 +3482,14 @@ class ServerArgs:
                 f"NCCL_EP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
 
+        if self.moe_a2a_backend == "epv2":
+            logger.warning("Cuda graph is disabled because DeepEP v2 uses high-throughput dispatch")
+            self.disable_cuda_graph = True
+            self.ep_size = self.tp_size
+            logger.warning(
+                f"DeepEP v2 MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
+            )
+
         if self.moe_a2a_backend == "ascend_fuseep":
             self.ep_size = self.tp_size
             logger.warning(
@@ -5950,6 +5961,16 @@ class ServerArgs:
             default=ServerArgs.ncclep_dispatcher_output_dtype,
             help=(
                 "Select the NCCL_EP dispatcher output dtype. auto maps DeepGEMM "
+                "to fp8 activation+scales and Triton to bf16 activation without scales."
+            ),
+        )
+        parser.add_argument(
+            "--epv2-dispatcher-output-dtype",
+            type=str,
+            choices=["auto", "bf16", "fp8"],
+            default=ServerArgs.epv2_dispatcher_output_dtype,
+            help=(
+                "Select the DeepEP v2 dispatcher output dtype. auto maps DeepGEMM "
                 "to fp8 activation+scales and Triton to bf16 activation without scales."
             ),
         )

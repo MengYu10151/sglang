@@ -31,6 +31,8 @@ if TYPE_CHECKING:
         NcclEpLowLatencyDispatchOutput,
         NcclEpHighThroughputCombineInput,
         NcclEpLowLatencyCombineInput,
+        EpV2CombineInput,
+        EpV2DispatchOutput,
         StandardCombineInput,
         StandardDispatchOutput,
     )
@@ -179,6 +181,12 @@ class DispatchOutputChecker:
     ) -> TypeGuard[Union[NcclEpHighThroughputDispatchOutput, NcclEpLowLatencyDispatchOutput]]:
         return dispatch_output.format.is_ncclep()
 
+    @staticmethod
+    def format_is_epv2(
+        dispatch_output: DispatchOutput,
+    ) -> TypeGuard[EpV2DispatchOutput]:
+        return dispatch_output.format.is_epv2()
+
 
 class DispatchOutputFormat(Enum):
 
@@ -188,6 +196,7 @@ class DispatchOutputFormat(Enum):
     FLASHINFER = "flashinfer"
     NCCL_EP_HT = "ncclep_high_throughput"
     NCCL_EP_LL = "ncclep_low_latency"
+    EPV2 = "epv2"
 
     def is_standard(self) -> bool:
         return self == DispatchOutputFormat.STANDARD
@@ -218,6 +227,9 @@ class DispatchOutputFormat(Enum):
             DispatchOutputFormat.NCCL_EP_HT,
             DispatchOutputFormat.NCCL_EP_LL,
         ]
+
+    def is_epv2(self) -> bool:
+        return self == DispatchOutputFormat.EPV2
 
 
 @runtime_checkable
@@ -288,6 +300,12 @@ class CombineInputChecker:
             CombineInputFormat.NCCL_EP_LL,
         ]
 
+    @staticmethod
+    def format_is_epv2(
+        combine_input: CombineInput,
+    ) -> TypeGuard[EpV2CombineInput]:
+        return combine_input.format == CombineInputFormat.EPV2
+
 
 class CombineInputFormat(Enum):
     STANDARD = "standard"
@@ -296,6 +314,7 @@ class CombineInputFormat(Enum):
     FLASHINFER = "flashinfer"
     NCCL_EP_HT = "ncclep_high_throughput"
     NCCL_EP_LL = "ncclep_low_latency"
+    EPV2 = "epv2"
 
 
 @runtime_checkable
