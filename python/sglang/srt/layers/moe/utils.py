@@ -4,7 +4,7 @@ import logging
 import os
 from contextlib import contextmanager
 from enum import Enum, IntEnum
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, NamedTuple, Optional
 
 import torch
 
@@ -161,6 +161,18 @@ class EpV2OutputDtype(Enum):
     FP8 = "fp8"
 
 
+class EpV2RunnerCapability(NamedTuple):
+    """
+    Describes the EPv2 dispatcher contract required by the active MoE runner.
+
+    The dispatcher should depend on this explicit contract instead of peeking at
+    runner implementation details such as DeepGEMM JIT flags.
+    """
+
+    output_dtype: EpV2OutputDtype
+    expert_alignment: int
+
+
 class DeepEPMode(Enum):
 
     NORMAL = "normal"
@@ -294,6 +306,15 @@ def get_epv2_output_dtype(self) -> EpV2OutputDtype:
         "--epv2-dispatcher-output-dtype explicitly only after adding a matching "
         "DeepEP v2 runner adapter."
     )
+
+
+def get_epv2_runner_capability(self) -> EpV2RunnerCapability:
+    output_dtype = get_epv2_output_dtype(self)
+    if output_dtype == EpV2OutputDtype.FP8:
+        # The currently supported FP8 adapter is DeepGEMM, whose expert-major
+        # input path requires 128-token expert alignment.
+        return EpV2RunnerCapability(output_dtype=output_dtype, expert_alignment=128)
+    return EpV2RunnerCapability(output_dtype=output_dtype, expert_alignment=1)
 
 
 MOE_A2A_BACKEND: Optional[MoeA2ABackend] = None

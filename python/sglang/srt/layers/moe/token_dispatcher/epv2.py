@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from enum import Enum, auto
-from typing import List, NamedTuple, Optional, Tuple, Union
+from typing import List, NamedTuple, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -17,12 +17,17 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
     DispatchOutputFormat,
 )
 from sglang.srt.layers.moe.topk import TopKOutput
-from sglang.srt.layers.moe.utils import EpV2OutputDtype, get_epv2_output_dtype
+from sglang.srt.layers.moe.utils import (
+    EpV2OutputDtype,
+    get_epv2_runner_capability,
+)
 
 logger = logging.getLogger(__name__)
 
 _SCALE_BLOCK_SIZE = 128
 _epv2_import_error: Optional[BaseException] = None
+_fp8_quant_import_error: Optional[BaseException] = None
+sglang_per_token_group_quant_fp8 = None
 
 try:
     from deep_ep import ElasticBuffer
@@ -33,7 +38,12 @@ except (ImportError, OSError) as exc:
     _epv2_import_error = exc
 
 if use_epv2:
-    from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
+    try:
+        from sglang.srt.layers.quantization.fp8_kernel import (
+            sglang_per_token_group_quant_fp8,
+        )
+    except (ImportError, OSError) as exc:
+        _fp8_quant_import_error = exc
 
 
 class EpV2DispatchOutput(NamedTuple):
@@ -62,7 +72,40 @@ assert isinstance(EpV2DispatchOutput, DispatchOutput)
 assert isinstance(EpV2CombineInput, CombineInput)
 
 
+def _raise_epv2_import_error() -> None:
+    detail = (
+        f" Original import error: {_epv2_import_error}"
+        if _epv2_import_error is not None
+        else ""
+    )
+    raise ImportError(
+        "DeepEP v2 (ElasticBuffer) is not available. Install DeepEP v2 from "
+        "https://github.com/deepseek-ai/DeepEP."
+        + detail
+    )
+
+
+def _ensure_epv2_available() -> None:
+    if not use_epv2:
+        _raise_epv2_import_error()
+
+
+def _ensure_fp8_quant_available() -> None:
+    _ensure_epv2_available()
+    if sglang_per_token_group_quant_fp8 is None:
+        detail = (
+            f" Original import error: {_fp8_quant_import_error}"
+            if _fp8_quant_import_error is not None
+            else ""
+        )
+        raise ImportError(
+            "DeepEP v2 FP8 dispatch requires the SGLang FP8 quantization kernel."
+            + detail
+        )
+
+
 def _quantize_for_epv2_dispatch(hidden_states: torch.Tensor):
+    _ensure_fp8_quant_available()
     return sglang_per_token_group_quant_fp8(
         hidden_states,
         _SCALE_BLOCK_SIZE,
@@ -85,17 +128,7 @@ class EpV2Buffer:
         num_max_dispatch_tokens_per_rank: int,
         use_fp8_dispatch: bool,
     ) -> "ElasticBuffer":
-        if not use_epv2:
-            detail = (
-                f" Original import error: {_epv2_import_error}"
-                if _epv2_import_error is not None
-                else ""
-            )
-            raise ImportError(
-                "DeepEP v2 (ElasticBuffer) is not available. Install DeepEP v2 from "
-                "https://github.com/deepseek-ai/DeepEP."
-                + detail
-            )
+        _ensure_epv2_available()
 
         allow_hybrid_mode = envs.SGLANG_EPV2_ALLOW_HYBRID_MODE.get()
         key = (
@@ -151,6 +184,7 @@ class _EpV2Impl:
         num_local_experts: int,
         hidden_size: int,
         output_dtype: EpV2OutputDtype,
+        expert_alignment: int,
         num_max_dispatch_tokens_per_rank: int,
     ):
         self.group = group
@@ -159,15 +193,22 @@ class _EpV2Impl:
         self.num_local_experts = num_local_experts
         self.hidden_size = hidden_size
         self.output_dtype = output_dtype
+        self.expert_alignment = expert_alignment
         self.num_max_dispatch_tokens_per_rank = num_max_dispatch_tokens_per_rank
         self.rank = dist.get_rank(group)
         self._handle = None
         self._num_input_tokens = 0
 
-    def set_output_dtype(self, output_dtype: EpV2OutputDtype) -> None:
-        if self.output_dtype != output_dtype:
+    def set_runner_capability(
+        self, output_dtype: EpV2OutputDtype, expert_alignment: int
+    ) -> None:
+        if (
+            self.output_dtype != output_dtype
+            or self.expert_alignment != expert_alignment
+        ):
             self._destroy_handle()
             self.output_dtype = output_dtype
+            self.expert_alignment = expert_alignment
 
     def _uses_fp8_dispatch_output(self) -> bool:
         return self.output_dtype == EpV2OutputDtype.FP8
@@ -189,7 +230,7 @@ class _EpV2Impl:
     ) -> None:
         if hidden_states.shape[0] > self.num_max_dispatch_tokens_per_rank:
             raise ValueError(
-                f"DeepEP v2 requires tokens per rank <= "
+                f"DeepEP v2 dispatch input exceeds the per-rank buffer capacity "
                 f"{self.num_max_dispatch_tokens_per_rank}, got {hidden_states.shape[0]}. "
                 "Increase SGLANG_EPV2_NUM_MAX_DISPATCH_TOKENS_PER_RANK."
             )
@@ -230,6 +271,7 @@ class _EpV2Impl:
         )
 
     def dispatch(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
+        _ensure_epv2_available()
         topk_weights = topk_output.topk_weights
         topk_ids = topk_output.topk_ids.to(torch.int64)
         self._validate_common(hidden_states, topk_ids)
@@ -243,7 +285,6 @@ class _EpV2Impl:
             use_tma_aligned_col_major_sf = False
 
         buffer = self._get_buffer()
-        expert_alignment = 128 if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM else 1
         self._destroy_handle()
         recv_x, recv_topk_idx, recv_topk_weights, handle, event = buffer.dispatch(
             dispatch_x,
@@ -251,9 +292,11 @@ class _EpV2Impl:
             topk_weights=topk_weights,
             num_experts=self.num_experts,
             num_max_tokens_per_rank=self.num_max_dispatch_tokens_per_rank,
-            expert_alignment=expert_alignment,
+            expert_alignment=self.expert_alignment,
             use_tma_aligned_col_major_sf=use_tma_aligned_col_major_sf,
-            do_cpu_sync=True,
+            # None keeps ElasticBuffer's documented default: CPU sync is used
+            # for a fresh handle so exact receive counts are available.
+            do_cpu_sync=None,
         )
         if event.event is not None:
             event.current_stream_wait()
@@ -290,15 +333,17 @@ class _EpV2Impl:
             raise RuntimeError("DeepEP v2 combine called without a valid dispatch handle")
 
         buffer = self._get_buffer()
-        combined_x, _, event = buffer.combine(
-            combine_input.hidden_states,
-            handle=self._handle,
-            topk_weights=combine_input.topk_weights,
-        )
-        if event.event is not None:
-            event.current_stream_wait()
-        self._destroy_handle()
-        return combined_x
+        try:
+            combined_x, _, event = buffer.combine(
+                combine_input.hidden_states,
+                handle=self._handle,
+                topk_weights=combine_input.topk_weights,
+            )
+            if event.event is not None:
+                event.current_stream_wait()
+            return combined_x
+        finally:
+            self._destroy_handle()
 
 
 class _Stage(Enum):
@@ -323,7 +368,8 @@ class EpV2Dispatcher(BaseDispatcher):
                 f"got {params_dtype}"
             )
         self.quant_config = {}
-        self.output_dtype = get_epv2_output_dtype(self)
+        capability = get_epv2_runner_capability(self)
+        self.output_dtype = capability.output_dtype
         self.num_max_dispatch_tokens_per_rank = (
             envs.SGLANG_EPV2_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
         )
@@ -334,14 +380,18 @@ class EpV2Dispatcher(BaseDispatcher):
             num_local_experts=num_local_experts,
             hidden_size=hidden_size,
             output_dtype=self.output_dtype,
+            expert_alignment=capability.expert_alignment,
             num_max_dispatch_tokens_per_rank=self.num_max_dispatch_tokens_per_rank,
         )
         self._stage = _Stage.INITIAL
 
     def set_quant_config(self, quant_config: dict) -> None:
         self.quant_config = quant_config
-        self.output_dtype = get_epv2_output_dtype(self)
-        self._impl.set_output_dtype(self.output_dtype)
+        capability = get_epv2_runner_capability(self)
+        self.output_dtype = capability.output_dtype
+        self._impl.set_runner_capability(
+            capability.output_dtype, capability.expert_alignment
+        )
 
     def dispatch(
         self, hidden_states: torch.Tensor, topk_output: TopKOutput
@@ -363,6 +413,7 @@ class EpV2Dispatcher(BaseDispatcher):
             raise TypeError(
                 f"Expected DeepEP v2 combine input, got {combine_input.format}"
             )
-        out = self._impl.combine(combine_input)
-        self._stage = _Stage.INITIAL
-        return out
+        try:
+            return self._impl.combine(combine_input)
+        finally:
+            self._stage = _Stage.INITIAL

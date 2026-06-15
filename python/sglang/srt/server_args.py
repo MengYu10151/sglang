@@ -3780,11 +3780,37 @@ class ServerArgs:
             )
 
         if self.moe_a2a_backend == "epv2":
+            if self.moe_runner_backend not in ["deep_gemm", "triton"]:
+                raise ValueError(
+                    "DeepEP v2 MoE currently supports only "
+                    "--moe-runner-backend deep_gemm or triton. "
+                    f"Got {self.moe_runner_backend!r}. Add a runner adapter before "
+                    "enabling EPv2 with other MoE runners."
+                )
+            if self.enable_two_batch_overlap or self.enable_single_batch_overlap:
+                raise ValueError(
+                    "DeepEP v2 MoE has not implemented the TBO/SBO overlap hooks yet. "
+                    "Disable --enable-two-batch-overlap and "
+                    "--enable-single-batch-overlap when using --moe-a2a-backend epv2."
+                )
+            if self.enforce_shared_experts_fusion:
+                raise ValueError(
+                    "DeepEP v2 MoE has not validated fused shared experts yet. "
+                    "Remove --enforce-shared-experts-fusion when using "
+                    "--moe-a2a-backend epv2."
+                )
             self.ep_size = self.tp_size
+            self.disable_shared_experts_fusion = True
             self.cuda_graph_config.decode.backend = Backend.DISABLED
             self.cuda_graph_config.prefill.backend = Backend.DISABLED
             logger.warning(
                 f"DeepEP v2 MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
+            )
+            logger.warning(
+                "DeepEP v2 MoE currently disables cuda graph and shared expert "
+                "fusion. SGLANG_EPV2_NUM_MAX_DISPATCH_TOKENS_PER_RANK is a "
+                "per-rank communication buffer capacity, not a model limit; "
+                "increase it for large prefill/chunked-prefill workloads."
             )
 
         if self.moe_a2a_backend == "ascend_fuseep":

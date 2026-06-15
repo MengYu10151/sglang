@@ -122,7 +122,9 @@ class TritonRunnerCore(MoeRunnerCore):
             no_combine=self.config.no_combine,
             inplace=self.config.inplace,
             apply_router_weight_on_input=self.config.apply_router_weight_on_input,
-            routed_scaling_factor=self.config.routed_scaling_factor,
+            routed_scaling_factor=running_state.get(
+                "epv2_routed_scaling_factor", self.config.routed_scaling_factor
+            ),
             gemm1_alpha=self.config.gemm1_alpha,
             gemm1_limit=self.config.gemm1_clamp_limit,
             filter_expert=filter_expert,
@@ -291,14 +293,6 @@ def _prepare_triton_runner_input(
     )
 
 
-def _disable_triton_internal_routed_scale_for_ep(
-    runner_config: MoeRunnerConfig,
-) -> None:
-    # A2A EP combine inputs are kept unscaled. The model-level MoE forward
-    # applies the routed scaling factor once after combine.
-    runner_config.routed_scaling_factor = None
-
-
 @register_pre_permute("epv2", "triton")
 def pre_permute_epv2_to_triton(
     dispatch_output: EpV2DispatchOutput,
@@ -312,7 +306,9 @@ def pre_permute_epv2_to_triton(
             "DeepEP v2 -> Triton expects BF16 dispatch output without activation scales. "
             "Use --epv2-dispatcher-output-dtype bf16."
         )
-    _disable_triton_internal_routed_scale_for_ep(runner_config)
+    # A2A EP combine inputs are kept unscaled. The model-level MoE forward
+    # applies the routed scaling factor once after combine.
+    running_state["epv2_routed_scaling_factor"] = None
     valid_rows = (topk_ids >= 0).any(dim=1)
     running_state["epv2_output_shape"] = hidden_states.shape
     running_state["epv2_valid_rows"] = valid_rows

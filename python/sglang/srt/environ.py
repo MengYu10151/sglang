@@ -568,6 +568,9 @@ class Envs:
     # DeepEP
     SGLANG_DEEPEP_BF16_DISPATCH = EnvBool(False) # This argument is deprecated
     SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
+    # DeepEP v2 per-rank communication buffer capacity. This is not a model
+    # semantic token limit; large prefill/chunked-prefill workloads may need a
+    # larger value.
     SGLANG_EPV2_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
     SGLANG_EPV2_ALLOW_HYBRID_MODE = EnvBool(False)
     SGLANG_DEEPEP_LL_COMBINE_SEND_NUM_SMS = EnvInt(32)
