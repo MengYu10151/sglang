@@ -299,6 +299,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
 
         if (
             not get_moe_a2a_backend().is_deepep()
+            and not get_moe_a2a_backend().is_ncclep()
             and not get_moe_a2a_backend().is_ascend_fuseep()
         ):
             return self.forward_normal(

@@ -10,6 +10,7 @@ from typing import List, NamedTuple, Optional, Tuple
 import torch
 import torch.distributed as dist
 
+from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.moe.token_dispatcher.base import (
@@ -26,6 +27,7 @@ from sglang.srt.layers.moe.utils import (
     get_ncclep_output_dtype,
 )
 from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
+from sglang.srt.utils.common import load_json_config
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +35,42 @@ _SCALE_BLOCK_SIZE = 128
 _LL_FP8_SCALE_ALIGNMENT = 512
 _LL_MAX_TOPK = 9
 _ncclep_import_error: Optional[BaseException] = None
+
+
+class NcclEpConfig:
+    def __init__(self, config_str: str):
+        self.config = load_json_config(config_str) if config_str else {}
+        if self.config and not isinstance(self.config, dict):
+            raise ValueError("NCCL_EP config must be a JSON object")
+
+    def max_num_sms(self, mode: NcclEpMode) -> int:
+        mode_config = self.config.get(mode.value, {}) if self.config else {}
+        if mode_config is None:
+            mode_config = {}
+        if not isinstance(mode_config, dict):
+            raise ValueError(
+                f"NCCL_EP config for {mode.value} must be a JSON object"
+            )
+
+        has_num_sms = "num_sms" in mode_config
+        has_max_num_sms = "max_num_sms" in mode_config
+        if has_num_sms and has_max_num_sms:
+            raise ValueError(
+                f"NCCL_EP config for {mode.value} should set only one of "
+                "num_sms or max_num_sms"
+            )
+        value = mode_config.get("num_sms", mode_config.get("max_num_sms", 0))
+        if value is None:
+            value = 0
+        if not isinstance(value, int):
+            raise ValueError(
+                f"NCCL_EP {mode.value} num_sms/max_num_sms must be an int, got {value!r}"
+            )
+        if value < 0:
+            raise ValueError(
+                f"NCCL_EP {mode.value} num_sms/max_num_sms must be >= 0, got {value}"
+            )
+        return value
 
 
 def _dlopen_global(path: Path, label: str) -> None:
@@ -226,6 +264,10 @@ class NcclEpBuffer:
     _comm = None
     _ep_group: Optional["Group"] = None
     _group_key: Optional[Tuple] = None
+    _ll_buffer_key: Optional[Tuple] = None
+    _ll_output_tokens: Optional[torch.Tensor] = None
+    _ll_output_scales: Optional[torch.Tensor] = None
+    _ll_recv_count: Optional[torch.Tensor] = None
     _library_paths_logged = False
 
     @classmethod
@@ -236,6 +278,7 @@ class NcclEpBuffer:
         mode: NcclEpMode,
         output_dtype: NcclEpOutputDtype,
         num_max_dispatch_tokens_per_rank: int,
+        max_num_sms: int,
         num_experts: int,
         num_local_experts: int,
     ):
@@ -278,6 +321,7 @@ class NcclEpBuffer:
             mode.value,
             output_dtype.value,
             num_max_dispatch_tokens_per_rank,
+            max_num_sms,
             max_recv_tokens_per_rank,
             num_experts,
             num_local_experts,
@@ -296,6 +340,7 @@ class NcclEpBuffer:
             max_dispatch_tokens_per_rank=num_max_dispatch_tokens_per_rank,
             max_recv_tokens_per_rank=max_recv_tokens_per_rank,
             max_token_bytes=hidden_size * 2,
+            max_num_sms=max_num_sms,
             num_qp_per_rank=(
                 num_local_experts if mode.is_low_latency() else 0
             ),
@@ -305,7 +350,8 @@ class NcclEpBuffer:
         logger.info(
             "Initialized NCCL_EP group: mode=%s output_dtype=%s world_size=%s num_experts=%s "
             "num_local_experts=%s max_dispatch_tokens_per_rank=%s "
-            "max_recv_tokens_per_rank=%s hidden_size=%s num_qp_per_rank=%s",
+            "max_recv_tokens_per_rank=%s hidden_size=%s num_qp_per_rank=%s "
+            "max_num_sms=%s",
             mode.value,
             output_dtype.value,
             world_size,
@@ -315,6 +361,7 @@ class NcclEpBuffer:
             max_recv_tokens_per_rank,
             hidden_size,
             num_local_experts if mode.is_low_latency() else 0,
+            max_num_sms,
         )
         return cls._comm, cls._ep_group
 
@@ -362,7 +409,91 @@ class NcclEpBuffer:
             )
 
     @classmethod
+    def destroy_low_latency_buffers(cls):
+        cls._ll_buffer_key = None
+        cls._ll_output_tokens = None
+        cls._ll_output_scales = None
+        cls._ll_recv_count = None
+
+    @classmethod
+    def get_low_latency_buffers(
+        cls,
+        *,
+        output_dtype: NcclEpOutputDtype,
+        num_local_experts: int,
+        max_recv_tokens_per_rank: int,
+        hidden_size: int,
+    ):
+        device = torch.cuda.current_device()
+        token_shape = (num_local_experts, max_recv_tokens_per_rank, hidden_size)
+        scale_shape = (
+            num_local_experts,
+            max_recv_tokens_per_rank,
+            hidden_size // _SCALE_BLOCK_SIZE,
+        )
+        scale_storage_shape = (
+            num_local_experts,
+            hidden_size // _SCALE_BLOCK_SIZE,
+            max_recv_tokens_per_rank,
+        )
+        count_shape = (num_local_experts,)
+        key = (
+            device,
+            output_dtype.value,
+            token_shape,
+            scale_shape if output_dtype == NcclEpOutputDtype.FP8 else None,
+            count_shape,
+        )
+        if cls._ll_buffer_key != key:
+            cls._ll_output_tokens = torch.empty(
+                token_shape,
+                dtype=(
+                    torch.float8_e4m3fn
+                    if output_dtype == NcclEpOutputDtype.FP8
+                    else torch.bfloat16
+                ),
+                device="cuda",
+            )
+            if output_dtype == NcclEpOutputDtype.FP8:
+                # NCCL_EP LL writes scales in scale-major memory order:
+                # [local_expert, scale_block, slot]. Expose a logical
+                # [local_expert, slot, scale_block] view to the MoE runner.
+                cls._ll_output_scales = torch.empty(
+                    scale_storage_shape,
+                    dtype=torch.float32,
+                    device="cuda",
+                ).transpose(1, 2)
+            else:
+                cls._ll_output_scales = None
+            cls._ll_recv_count = torch.zeros(
+                count_shape, dtype=torch.int32, device="cuda"
+            )
+            cls._ll_buffer_key = key
+        if cls._ll_output_tokens is None or cls._ll_recv_count is None:
+            raise RuntimeError("NCCL_EP low_latency shared buffers are not initialized")
+        if tuple(cls._ll_output_tokens.shape) != token_shape:
+            raise RuntimeError(
+                "NCCL_EP low_latency shared token buffer shape mismatch: "
+                f"got {tuple(cls._ll_output_tokens.shape)}, expected {token_shape}"
+            )
+        if (
+            cls._ll_output_scales is not None
+            and tuple(cls._ll_output_scales.shape) != scale_shape
+        ):
+            raise RuntimeError(
+                "NCCL_EP low_latency shared scale buffer shape mismatch: "
+                f"got {tuple(cls._ll_output_scales.shape)}, expected {scale_shape}"
+            )
+        if tuple(cls._ll_recv_count.shape) != count_shape:
+            raise RuntimeError(
+                "NCCL_EP low_latency shared recv_count shape mismatch: "
+                f"got {tuple(cls._ll_recv_count.shape)}, expected {count_shape}"
+            )
+        return cls._ll_output_tokens, cls._ll_output_scales, cls._ll_recv_count
+
+    @classmethod
     def destroy(cls):
+        cls.destroy_low_latency_buffers()
         if cls._ep_group is not None:
             cls._ep_group.destroy()
         cls._ep_group = None
@@ -381,6 +512,8 @@ class _NcclEpImplBase:
         mode: NcclEpMode,
         output_dtype: NcclEpOutputDtype,
         num_max_dispatch_tokens_per_rank: int,
+        max_num_sms: int,
+        layer_id: Optional[int] = None,
     ):
         self.group = group
         self.router_topk = router_topk
@@ -390,6 +523,8 @@ class _NcclEpImplBase:
         self.mode = mode
         self.output_dtype = output_dtype
         self.num_max_dispatch_tokens_per_rank = num_max_dispatch_tokens_per_rank
+        self.max_num_sms = max_num_sms
+        self.layer_id = layer_id
         self.world_size = dist.get_world_size(group)
         self.rank = dist.get_rank(group)
         self._handle = None
@@ -405,6 +540,7 @@ class _NcclEpImplBase:
             self.mode,
             self.output_dtype,
             self.num_max_dispatch_tokens_per_rank,
+            self.max_num_sms,
             self.num_experts,
             self.num_local_experts,
         )
@@ -448,6 +584,41 @@ class _NcclEpImplBase:
             raise ValueError(
                 f"NCCL_EP low_latency supports topk <= {_LL_MAX_TOPK}, got {topk_ids.shape[1]}"
             )
+        if os.getenv("SGLANG_NCCLEP_DEBUG_TOPK"):
+            if topk_ids.numel() > 0:
+                topk_min = int(topk_ids.min().item())
+                topk_max = int(topk_ids.max().item())
+                if topk_min < 0 or topk_max >= self.num_experts:
+                    raise ValueError(
+                        "NCCL_EP topk_ids out of global expert range: "
+                        f"rank={self.rank} range=[{topk_min}, {topk_max}] "
+                        f"num_experts={self.num_experts} shape={tuple(topk_ids.shape)}"
+                    )
+                debug_count = getattr(self, "_debug_topk_logs", 0)
+                debug_limit = int(os.getenv("SGLANG_NCCLEP_DEBUG_TOPK_LIMIT", "4"))
+                if debug_count < debug_limit:
+                    dest_ranks = torch.div(
+                        topk_ids, self.num_local_experts, rounding_mode="floor"
+                    )
+                    dest_counts = torch.bincount(
+                        dest_ranks.reshape(-1), minlength=self.world_size
+                    )[: self.world_size].cpu().tolist()
+                    logger.info(
+                        "NCCL_EP debug topk rank=%s mode=%s hidden_shape=%s "
+                        "hidden_stride=%s contiguous=%s dtype=%s topk_shape=%s "
+                        "range=[%s,%s] dest_counts=%s",
+                        self.rank,
+                        self.mode.value,
+                        tuple(hidden_states.shape),
+                        tuple(hidden_states.stride()),
+                        hidden_states.is_contiguous(),
+                        hidden_states.dtype,
+                        tuple(topk_ids.shape),
+                        topk_min,
+                        topk_max,
+                        dest_counts,
+                    )
+                    self._debug_topk_logs = debug_count + 1
 
 
 class _NcclEpHighThroughputImpl(_NcclEpImplBase):
@@ -545,8 +716,9 @@ class _NcclEpHighThroughputImpl(_NcclEpImplBase):
             self._handle.update(topk_tensor, layout_info=layout_info, stream=_stream())
 
     def dispatch(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
-        topk_weights = topk_output.topk_weights
-        topk_ids = topk_output.topk_ids.to(torch.int64)
+        hidden_states = hidden_states.contiguous()
+        topk_weights = topk_output.topk_weights.contiguous()
+        topk_ids = topk_output.topk_ids.to(torch.int64).contiguous()
         self._validate_common(hidden_states, topk_ids)
         if self._uses_fp8_dispatch_output():
             q_hidden_states, hidden_states_scale = _quantize_for_ncclep_dispatch(
@@ -686,7 +858,7 @@ class _NcclEpHighThroughputImpl(_NcclEpImplBase):
                 if self._recv_scales is not None
                 else None
             ),
-            local_topk_ids,
+            local_topk_ids.to(torch.int32),
             recv_topk_weights,
             counts,
         )
@@ -716,12 +888,15 @@ class _NcclEpLowLatencyImpl(_NcclEpImplBase):
         self._output_tokens: Optional[torch.Tensor] = None
         self._output_scales: Optional[torch.Tensor] = None
         self._recv_count: Optional[torch.Tensor] = None
+        self._topk_ids: Optional[torch.Tensor] = None
 
     def set_output_dtype(self, output_dtype: NcclEpOutputDtype) -> None:
         if self.output_dtype != output_dtype:
             super().set_output_dtype(output_dtype)
             self._output_tokens = None
             self._output_scales = None
+            self._recv_count = None
+            NcclEpBuffer.destroy_low_latency_buffers()
 
     def _ensure_buffers(self) -> None:
         max_slots = self.max_recv_tokens_per_rank
@@ -731,35 +906,16 @@ class _NcclEpLowLatencyImpl(_NcclEpImplBase):
             max_slots,
             self.hidden_size // _SCALE_BLOCK_SIZE,
         )
-        count_shape = (self.num_local_experts,)
-        # DeepGEMM owns and disposes runner inputs after GEMM, so LL dispatch
-        # outputs cannot be treated as reusable dispatcher-owned buffers.
-        self._output_tokens = torch.empty(
-            token_shape,
-            dtype=(
-                torch.float8_e4m3fn
-                if self._uses_fp8_dispatch_output()
-                else torch.bfloat16
-            ),
-            device="cuda",
+        (
+            self._output_tokens,
+            self._output_scales,
+            self._recv_count,
+        ) = NcclEpBuffer.get_low_latency_buffers(
+            output_dtype=self.output_dtype,
+            num_local_experts=self.num_local_experts,
+            max_recv_tokens_per_rank=max_slots,
+            hidden_size=self.hidden_size,
         )
-        if self._uses_fp8_dispatch_output():
-            # NCCL_EP LL writes scales in scale-major memory order:
-            # [local_expert, scale_block, slot]. Expose a logical
-            # [local_expert, slot, scale_block] view to DeepGEMM.
-            self._output_scales = torch.empty(
-                (
-                    self.num_local_experts,
-                    self.hidden_size // _SCALE_BLOCK_SIZE,
-                    max_slots,
-                ),
-                dtype=torch.float32,
-                device="cuda",
-            ).transpose(1, 2)
-        else:
-            self._output_scales = None
-        if self._recv_count is None or tuple(self._recv_count.shape) != count_shape:
-            self._recv_count = torch.zeros(count_shape, dtype=torch.int32, device="cuda")
         if tuple(self._output_tokens.shape) != token_shape:
             raise RuntimeError(
                 "Failed to allocate NCCL_EP low_latency output token buffer: "
@@ -775,23 +931,150 @@ class _NcclEpLowLatencyImpl(_NcclEpImplBase):
             )
 
     def dispatch(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
-        topk_weights = topk_output.topk_weights
-        topk_ids = topk_output.topk_ids.to(torch.int64)
+        hidden_states = hidden_states.contiguous()
+        topk_weights = topk_output.topk_weights.contiguous()
+        topk_ids = topk_output.topk_ids.to(torch.int64).contiguous()
+        self._topk_ids = topk_ids
+        trace_ll = os.getenv("SGLANG_NCCLEP_TRACE_LL")
+        trace_id = getattr(self, "_trace_ll_dispatch_id", 0)
+        self._trace_ll_dispatch_id = trace_id + 1
+        if trace_ll:
+            logger.info(
+                "NCCL_EP LL trace rank=%s call=%s phase=dispatch_begin "
+                "layer=%s tokens=%s hidden_shape=%s topk_shape=%s",
+                self.rank,
+                trace_id,
+                self.layer_id,
+                hidden_states.shape[0],
+                tuple(hidden_states.shape),
+                tuple(topk_ids.shape),
+            )
         self._validate_common(hidden_states, topk_ids)
+        dump_dir = os.getenv("SGLANG_NCCLEP_DUMP_TOPK_DIR")
+        if dump_dir and hidden_states.shape[0] > 0:
+            try:
+                path = Path(dump_dir)
+                path.mkdir(parents=True, exist_ok=True)
+                valid_topk_ids = topk_ids[topk_ids >= 0]
+                dest_ranks = torch.div(
+                    valid_topk_ids, self.num_local_experts, rounding_mode="floor"
+                )
+                dest_counts = torch.bincount(
+                    dest_ranks.reshape(-1), minlength=self.world_size
+                )[: self.world_size]
+                torch.save(
+                    {
+                        "rank": self.rank,
+                        "layer_id": self.layer_id,
+                        "tokens_shape": tuple(hidden_states.shape),
+                        "topk_shape": tuple(topk_ids.shape),
+                        "dest_counts": dest_counts.detach().cpu(),
+                        "valid_topk_count": int(valid_topk_ids.numel()),
+                    },
+                    path / f"rank{self.rank}_layer{self.layer_id}_call{trace_id}.pt",
+                )
+            except Exception as exc:
+                logger.warning("NCCL_EP LL topk dump failed: %s", exc)
+        if trace_ll:
+            logger.info(
+                "NCCL_EP LL trace rank=%s call=%s phase=after_validate_common",
+                self.rank,
+                trace_id,
+            )
+        if trace_ll:
+            logger.info(
+                "NCCL_EP LL trace rank=%s call=%s phase=before_get_ep",
+                self.rank,
+                trace_id,
+            )
         _, ep_group = self._get_ep()
+        if trace_ll:
+            logger.info(
+                "NCCL_EP LL trace rank=%s call=%s phase=after_get_ep",
+                self.rank,
+                trace_id,
+            )
         num_tokens = hidden_states.shape[0]
         self._ensure_buffers()
+        if trace_ll:
+            logger.info(
+                "NCCL_EP LL trace rank=%s call=%s phase=after_ensure_buffers "
+                "max_slots=%s",
+                self.rank,
+                trace_id,
+                self.max_recv_tokens_per_rank,
+            )
         self._recv_count.zero_()
         self._output_tokens.zero_()
         if self._output_scales is not None:
             self._output_scales.zero_()
 
+        if os.getenv("SGLANG_NCCLEP_PRESYNC_DISPATCH"):
+            torch.cuda.synchronize()
+
+        if trace_ll:
+            logger.info(
+                "NCCL_EP LL trace rank=%s call=%s phase=before_create_handle",
+                self.rank,
+                trace_id,
+            )
+        if os.getenv("SGLANG_NCCLEP_BARRIER_BEFORE_DISPATCH"):
+            if trace_ll:
+                logger.info(
+                    "NCCL_EP LL trace rank=%s call=%s phase=before_barrier",
+                    self.rank,
+                    trace_id,
+                )
+            dist.barrier(group=self.group)
+            if trace_ll:
+                logger.info(
+                    "NCCL_EP LL trace rank=%s call=%s phase=after_barrier",
+                    self.rank,
+                    trace_id,
+                )
+        if os.getenv("SGLANG_NCCLEP_WORLD_BARRIER_BEFORE_DISPATCH"):
+            if trace_ll:
+                logger.info(
+                    "NCCL_EP LL trace rank=%s call=%s phase=before_world_barrier "
+                    "world_size=%s group_size=%s",
+                    self.rank,
+                    trace_id,
+                    dist.get_world_size(),
+                    dist.get_world_size(group=self.group),
+                )
+            dist.barrier()
+            if trace_ll:
+                logger.info(
+                    "NCCL_EP LL trace rank=%s call=%s phase=after_world_barrier",
+                    self.rank,
+                    trace_id,
+                )
+        if os.getenv("SGLANG_NCCLEP_TP_CPU_BARRIER_BEFORE_DISPATCH"):
+            if trace_ll:
+                logger.info(
+                    "NCCL_EP LL trace rank=%s call=%s phase=before_tp_cpu_barrier",
+                    self.rank,
+                    trace_id,
+                )
+            get_tp_group().barrier()
+            if trace_ll:
+                logger.info(
+                    "NCCL_EP LL trace rank=%s call=%s phase=after_tp_cpu_barrier",
+                    self.rank,
+                    trace_id,
+                )
         self._destroy_handle()
         self._handle = ep_group.create_handle(
             Layout.EXPERT_MAJOR,
-            Tensor(topk_ids),
+            Tensor(self._topk_ids),
             stream=_stream(),
         )
+        if trace_ll:
+            logger.info(
+                "NCCL_EP LL trace rank=%s call=%s phase=after_create_handle",
+                self.rank,
+                trace_id,
+            )
         output_tokens = Tensor(self._output_tokens)
         output_scales = (
             Tensor(self._output_scales) if self._output_scales is not None else None
@@ -811,6 +1094,12 @@ class _NcclEpLowLatencyImpl(_NcclEpImplBase):
             **({"scales": output_scales} if output_scales is not None else {}),
         )
         dispatch_config = DispatchConfig(round_scales=0)
+        if trace_ll:
+            logger.info(
+                "NCCL_EP LL trace rank=%s call=%s phase=before_dispatch",
+                self.rank,
+                trace_id,
+            )
         self._handle.dispatch(
             dispatch_inputs,
             dispatch_outputs,
@@ -818,8 +1107,41 @@ class _NcclEpLowLatencyImpl(_NcclEpImplBase):
             config=dispatch_config,
             stream=_stream(),
         )
+        if trace_ll:
+            logger.info(
+                "NCCL_EP LL trace rank=%s call=%s phase=after_dispatch_before_complete",
+                self.rank,
+                trace_id,
+            )
+        if os.getenv("SGLANG_NCCLEP_TP_CPU_BARRIER_AFTER_DISPATCH"):
+            if trace_ll:
+                logger.info(
+                    "NCCL_EP LL trace rank=%s call=%s phase=before_tp_cpu_barrier_after_dispatch",
+                    self.rank,
+                    trace_id,
+                )
+            get_tp_group().barrier()
+            if trace_ll:
+                logger.info(
+                    "NCCL_EP LL trace rank=%s call=%s phase=after_tp_cpu_barrier_after_dispatch",
+                    self.rank,
+                    trace_id,
+                )
         self._handle.complete(stream=_stream())
+        if trace_ll:
+            logger.info(
+                "NCCL_EP LL trace rank=%s call=%s phase=after_complete_before_sync",
+                self.rank,
+                trace_id,
+            )
         torch.cuda.synchronize()
+        if trace_ll:
+            logger.info(
+                "NCCL_EP LL trace rank=%s call=%s phase=after_sync recv_count_sum=%s",
+                self.rank,
+                trace_id,
+                int(self._recv_count.sum().item()),
+            )
 
         expected_m = (
             num_tokens * self.world_size * self.router_topk + self.num_experts
@@ -827,7 +1149,7 @@ class _NcclEpLowLatencyImpl(_NcclEpImplBase):
         return NcclEpLowLatencyDispatchOutput(
             self._output_tokens,
             self._output_scales,
-            topk_ids,
+            topk_ids.to(torch.int32),
             topk_weights,
             self._recv_count,
             expected_m,
@@ -836,6 +1158,19 @@ class _NcclEpLowLatencyImpl(_NcclEpImplBase):
     def combine(self, combine_input: NcclEpLowLatencyCombineInput) -> torch.Tensor:
         hidden_states, topk_ids, topk_weights = combine_input
         num_tokens = topk_weights.shape[0]
+        trace_ll = os.getenv("SGLANG_NCCLEP_TRACE_LL")
+        trace_id = getattr(self, "_trace_ll_combine_id", 0)
+        self._trace_ll_combine_id = trace_id + 1
+        if trace_ll:
+            logger.info(
+                "NCCL_EP LL trace rank=%s call=%s phase=combine_begin "
+                "layer=%s tokens=%s hidden_shape=%s",
+                self.rank,
+                trace_id,
+                self.layer_id,
+                num_tokens,
+                tuple(hidden_states.shape),
+            )
         combined = torch.empty(
             (num_tokens, self.hidden_size),
             dtype=torch.bfloat16,
@@ -847,15 +1182,40 @@ class _NcclEpLowLatencyImpl(_NcclEpImplBase):
             topk_weights=Tensor(topk_weights),
         )
         combine_config = CombineConfig(send_only=0)
+        if trace_ll:
+            logger.info(
+                "NCCL_EP LL trace rank=%s call=%s phase=before_combine",
+                self.rank,
+                trace_id,
+            )
         self._handle.combine(
             combine_inputs,
             combine_outputs,
             config=combine_config,
             stream=_stream(),
         )
+        if trace_ll:
+            logger.info(
+                "NCCL_EP LL trace rank=%s call=%s phase=after_combine_before_complete",
+                self.rank,
+                trace_id,
+            )
         self._handle.complete(stream=_stream())
+        if trace_ll:
+            logger.info(
+                "NCCL_EP LL trace rank=%s call=%s phase=combine_after_complete_before_sync",
+                self.rank,
+                trace_id,
+            )
         torch.cuda.synchronize()
-        self._destroy_handle()
+        if trace_ll:
+            logger.info(
+                "NCCL_EP LL trace rank=%s call=%s phase=combine_after_sync",
+                self.rank,
+                trace_id,
+            )
+        if not os.getenv("SGLANG_NCCLEP_DEFER_HANDLE_DESTROY"):
+            self._destroy_handle()
         return combined
 
 
@@ -874,6 +1234,8 @@ class NcclEpDispatcher(BaseDispatcher):
         hidden_size: int,
         params_dtype: torch.dtype,
         ncclep_mode: NcclEpMode,
+        ncclep_config: str,
+        layer_id: Optional[int] = None,
     ):
         super().__init__()
         if params_dtype != torch.bfloat16:
@@ -887,6 +1249,7 @@ class NcclEpDispatcher(BaseDispatcher):
         self.num_max_dispatch_tokens_per_rank = (
             envs.SGLANG_NCCL_EP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
         )
+        self.max_num_sms = NcclEpConfig(ncclep_config).max_num_sms(ncclep_mode)
         common = dict(
             group=group,
             router_topk=router_topk,
@@ -895,6 +1258,8 @@ class NcclEpDispatcher(BaseDispatcher):
             hidden_size=hidden_size,
             output_dtype=self.output_dtype,
             num_max_dispatch_tokens_per_rank=self.num_max_dispatch_tokens_per_rank,
+            max_num_sms=self.max_num_sms,
+            layer_id=layer_id,
         )
         if ncclep_mode.is_high_throughput():
             self._impl = _NcclEpHighThroughputImpl(**common)

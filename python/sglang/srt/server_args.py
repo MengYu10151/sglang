@@ -665,6 +665,7 @@ class ServerArgs:
     deepep_mode: Literal["auto", "normal", "low_latency"] = "auto"
     ncclep_mode: Literal["high_throughput", "low_latency"] = "high_throughput"
     ncclep_dispatcher_output_dtype: Literal["auto", "bf16", "fp8"] = "auto"
+    ncclep_config: Optional[str] = None
     deepep_dispatcher_output_dtype: Literal["auto", "bf16", "fp8", "int8", "nvfp4"] = (
         "auto"
     )
@@ -6340,6 +6341,16 @@ class ServerArgs:
             help=(
                 "Select the NCCL_EP dispatcher output dtype. auto maps DeepGEMM "
                 "to fp8 activation+scales and Triton to bf16 activation without scales."
+            ),
+        )
+        parser.add_argument(
+            "--ncclep-config",
+            type=str,
+            default=ServerArgs.ncclep_config,
+            help=(
+                "Tuned NCCL_EP config. It can be either a JSON string or a file path. "
+                "Currently supports per-mode num_sms/max_num_sms, e.g. "
+                "'{\"low_latency\":{\"num_sms\":32}}'."
             ),
         )
         parser.add_argument(

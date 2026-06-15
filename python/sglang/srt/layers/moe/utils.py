@@ -318,6 +318,7 @@ IS_TBO_ENABLED: Optional[bool] = None
 IS_SBO_ENABLED: Optional[bool] = None
 TBO_TOKEN_DISTRIBUTION_THRESHOLD: Optional[float] = None
 DEEPEP_CONFIG: Optional[str] = None
+NCCLEP_CONFIG: Optional[str] = None
 DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER: Optional[bool] = None
 MOE_QUANTIZATION: Optional[str] = None
 
@@ -330,6 +331,7 @@ def initialize_moe_config(server_args: ServerArgs):
     global DEEPEP_MODE
     global NCCLEP_MODE
     global DEEPEP_CONFIG
+    global NCCLEP_CONFIG
     global IS_TBO_ENABLED
     global IS_SBO_ENABLED
     global TBO_TOKEN_DISTRIBUTION_THRESHOLD
@@ -351,6 +353,7 @@ def initialize_moe_config(server_args: ServerArgs):
     DEEPEP_MODE = DeepEPMode(server_args.deepep_mode)
     NCCLEP_MODE = NcclEpMode(server_args.ncclep_mode)
     DEEPEP_CONFIG = server_args.deepep_config or ""
+    NCCLEP_CONFIG = server_args.ncclep_config or ""
     IS_TBO_ENABLED = server_args.enable_two_batch_overlap
     IS_SBO_ENABLED = server_args.enable_single_batch_overlap
     if IS_SBO_ENABLED and torch.cuda.is_available():
@@ -421,6 +424,14 @@ def get_deepep_config() -> str:
         logger.warning("DEEPEP_CONFIG is not initialized, using default config")
         DEEPEP_CONFIG = ""
     return DEEPEP_CONFIG
+
+
+def get_ncclep_config() -> str:
+    global NCCLEP_CONFIG
+    if NCCLEP_CONFIG is None:
+        logger.warning("NCCLEP_CONFIG is not initialized, using default config")
+        NCCLEP_CONFIG = ""
+    return NCCLEP_CONFIG
 
 
 def is_tbo_enabled() -> bool:

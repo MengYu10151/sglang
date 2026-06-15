@@ -319,6 +319,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                     dict(tp_rank=0, tp_size=1)
                     if (
                         get_moe_a2a_backend().is_deepep()
+                        or get_moe_a2a_backend().is_ncclep()
                         or get_moe_a2a_backend().is_flashinfer()
                     )
                     else {}
@@ -534,7 +535,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 
-        if get_moe_a2a_backend().is_deepep():
+        if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_ncclep():
             return self._forward_deepep(hidden_states, forward_batch)
 
         use_fused_gate = (

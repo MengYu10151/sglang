@@ -51,7 +51,11 @@ from sglang.srt.layers.moe.topk import (
     TopKOutput,
     TopKOutputChecker,
 )
-from sglang.srt.layers.moe.utils import RoutingMethodType, is_deepep_class_backend
+from sglang.srt.layers.moe.utils import (
+    RoutingMethodType,
+    get_ncclep_config,
+    is_deepep_class_backend,
+)
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     QuantizationConfig,
@@ -128,6 +132,8 @@ def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
             hidden_size=moe_runner_config.hidden_size,
             params_dtype=moe_runner_config.params_dtype,
             ncclep_mode=get_ncclep_mode(),
+            ncclep_config=get_ncclep_config(),
+            layer_id=moe_runner_config.layer_id,
         )
     elif a2a_backend.is_flashinfer():
         return FlashinferDispatcher(

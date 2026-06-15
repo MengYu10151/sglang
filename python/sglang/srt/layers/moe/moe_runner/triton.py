@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 from typing import TYPE_CHECKING, Any, List, Optional
 
 import torch
@@ -16,6 +17,8 @@ from sglang.srt.layers.moe.moe_runner.base import (
     register_pre_permute,
 )
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher.ncclep import (
@@ -371,16 +374,44 @@ def pre_permute_ncclep_low_latency_to_triton(
     slot_ids = torch.arange(max_slots, device=hidden_states.device)
     valid_mask = slot_ids.unsqueeze(0) < masked_m.to(torch.long).unsqueeze(1)
     expert_ids = (
-        torch.arange(num_local_experts, device=hidden_states.device, dtype=torch.int64)
+        torch.arange(num_local_experts, device=hidden_states.device, dtype=torch.int32)
         .unsqueeze(1)
         .expand(num_local_experts, max_slots)
     )
     running_state["ncclep_ll_output_shape"] = hidden_states.shape
+    running_state["ncclep_ll_output_buffer"] = hidden_states
     running_state["ncclep_ll_valid_mask"] = valid_mask
     running_state["ncclep_ll_topk_ids"] = topk_ids
     running_state["ncclep_ll_topk_weights"] = topk_weights
     hidden_states = hidden_states[valid_mask].contiguous()
     topk_ids = expert_ids[valid_mask].reshape(-1, 1).contiguous()
+    compact_tokens = hidden_states.shape[0]
+    dummy_empty = compact_tokens == 0
+    running_state["ncclep_ll_dummy_empty"] = dummy_empty
+    if dummy_empty:
+        # Triton MoE kernels do not accept zero-token inputs. Use one neutral
+        # local expert token and discard it before NCCL_EP combine.
+        hidden_states = torch.zeros(
+            (1, running_state["ncclep_ll_output_shape"][2]),
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+        topk_ids = torch.zeros((1, 1), dtype=torch.int32, device=hidden_states.device)
+    if __import__("os").getenv("SGLANG_NCCLEP_TRACE_TRITON_LL"):
+        try:
+            logger.info(
+                "NCCL_EP LL triton pre rank trace: output_shape=%s masked_m_shape=%s masked_m_sum=%s compact_tokens=%s runner_tokens=%s topk_shape=%s hidden_dtype=%s dummy_empty=%s",
+                tuple(running_state["ncclep_ll_output_shape"]),
+                tuple(masked_m.shape),
+                int(masked_m.sum().item()),
+                compact_tokens,
+                hidden_states.shape[0],
+                tuple(topk_ids.shape),
+                hidden_states.dtype,
+                dummy_empty,
+            )
+        except Exception as exc:
+            logger.warning("NCCL_EP LL triton pre trace failed: %s", exc)
     topk_weights = torch.ones(
         (hidden_states.shape[0], 1),
         dtype=torch.float32,
@@ -403,12 +434,9 @@ def post_permute_triton_to_ncclep_low_latency(
     )
 
     valid_mask = running_state["ncclep_ll_valid_mask"]
-    output = torch.zeros(
-        running_state["ncclep_ll_output_shape"],
-        device=runner_output.hidden_states.device,
-        dtype=runner_output.hidden_states.dtype,
-    )
-    output[valid_mask] = runner_output.hidden_states
+    output = running_state["ncclep_ll_output_buffer"]
+    if not running_state.get("ncclep_ll_dummy_empty", False):
+        output[valid_mask] = runner_output.hidden_states
     return NcclEpLowLatencyCombineInput(
         hidden_states=output,
         topk_ids=running_state["ncclep_ll_topk_ids"],
