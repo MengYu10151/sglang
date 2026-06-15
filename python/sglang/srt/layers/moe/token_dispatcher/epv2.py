@@ -104,6 +104,21 @@ def _ensure_fp8_quant_available() -> None:
         )
 
 
+def _get_allow_hybrid_mode() -> bool:
+    try:
+        from sglang.srt.server_args import get_global_server_args
+
+        server_args = get_global_server_args()
+    except ValueError:
+        # Synthetic/unit tests can instantiate the dispatcher without ServerArgs.
+        return envs.SGLANG_EPV2_ALLOW_HYBRID_MODE.get()
+
+    epv2_mode = getattr(server_args, "epv2_mode", None)
+    if epv2_mode is None:
+        return envs.SGLANG_EPV2_ALLOW_HYBRID_MODE.get()
+    return epv2_mode == "hybrid"
+
+
 def _quantize_for_epv2_dispatch(hidden_states: torch.Tensor):
     _ensure_fp8_quant_available()
     return sglang_per_token_group_quant_fp8(
@@ -130,7 +145,7 @@ class EpV2Buffer:
     ) -> "ElasticBuffer":
         _ensure_epv2_available()
 
-        allow_hybrid_mode = envs.SGLANG_EPV2_ALLOW_HYBRID_MODE.get()
+        allow_hybrid_mode = _get_allow_hybrid_mode()
         key = (
             id(group),
             hidden_size,

@@ -663,6 +663,7 @@ class ServerArgs:
     enforce_disable_flashinfer_allreduce_fusion: bool = False
     enable_aiter_allreduce_fusion: bool = False
     deepep_mode: Literal["auto", "normal", "low_latency"] = "auto"
+    epv2_mode: Literal["direct", "hybrid"] = "direct"
     epv2_dispatcher_output_dtype: Literal["auto", "bf16", "fp8"] = "auto"
     deepep_dispatcher_output_dtype: Literal["auto", "bf16", "fp8", "int8", "nvfp4"] = (
         "auto"
@@ -3807,10 +3808,14 @@ class ServerArgs:
                 f"DeepEP v2 MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
             logger.warning(
-                "DeepEP v2 MoE currently disables cuda graph and shared expert "
-                "fusion. SGLANG_EPV2_NUM_MAX_DISPATCH_TOKENS_PER_RANK is a "
+                "DeepEP v2 MoE is using epv2_mode=%s. This controls "
+                "ElasticBuffer direct/hybrid mode and is independent from "
+                "--deepep-mode normal/low_latency. DeepEP v2 MoE currently "
+                "disables cuda graph and shared expert fusion. "
+                "SGLANG_EPV2_NUM_MAX_DISPATCH_TOKENS_PER_RANK is a "
                 "per-rank communication buffer capacity, not a model limit; "
-                "increase it for large prefill/chunked-prefill workloads."
+                "increase it for large prefill/chunked-prefill workloads.",
+                self.epv2_mode,
             )
 
         if self.moe_a2a_backend == "ascend_fuseep":
@@ -6365,6 +6370,18 @@ class ServerArgs:
             choices=["auto", "bf16", "fp8", "int8", "nvfp4"],
             default="auto",
             help="Select DeepEP dispatcher output dtype",
+        )
+        parser.add_argument(
+            "--epv2-mode",
+            type=str,
+            choices=["direct", "hybrid"],
+            default=ServerArgs.epv2_mode,
+            help=(
+                "Select DeepEP v2 ElasticBuffer mode. `direct` disables "
+                "hybrid mode; `hybrid` enables DeepEP v2 hybrid "
+                "scale-up/scale-out mode. This is independent from "
+                "--deepep-mode normal/low_latency."
+            ),
         )
         parser.add_argument(
             "--epv2-dispatcher-output-dtype",
