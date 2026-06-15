@@ -253,6 +253,7 @@ MOE_A2A_BACKEND_CHOICES = [
     "ascend_fuseep",
     "flashinfer",
     "megamoe",
+    "epv2",
 ]
 
 FP8_GEMM_RUNNER_BACKEND_CHOICES = [
@@ -654,6 +655,7 @@ class ServerArgs:
         "ascend_fuseep",
         "flashinfer",
         "megamoe",
+        "epv2",
     ] = "none"
     moe_runner_backend: str = "auto"
     flashinfer_mxfp4_moe_precision: Literal["default", "bf16"] = "default"
@@ -661,6 +663,7 @@ class ServerArgs:
     enforce_disable_flashinfer_allreduce_fusion: bool = False
     enable_aiter_allreduce_fusion: bool = False
     deepep_mode: Literal["auto", "normal", "low_latency"] = "auto"
+    epv2_dispatcher_output_dtype: Literal["auto", "bf16", "fp8"] = "auto"
     deepep_dispatcher_output_dtype: Literal["auto", "bf16", "fp8", "int8", "nvfp4"] = (
         "auto"
     )
@@ -3776,6 +3779,14 @@ class ServerArgs:
                 f"Nixl MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
 
+        if self.moe_a2a_backend == "epv2":
+            self.ep_size = self.tp_size
+            self.cuda_graph_config.decode.backend = Backend.DISABLED
+            self.cuda_graph_config.prefill.backend = Backend.DISABLED
+            logger.warning(
+                f"DeepEP v2 MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
+            )
+
         if self.moe_a2a_backend == "ascend_fuseep":
             self.ep_size = self.tp_size
             logger.warning(
@@ -6328,6 +6339,13 @@ class ServerArgs:
             choices=["auto", "bf16", "fp8", "int8", "nvfp4"],
             default="auto",
             help="Select DeepEP dispatcher output dtype",
+        )
+        parser.add_argument(
+            "--epv2-dispatcher-output-dtype",
+            type=str,
+            choices=["auto", "bf16", "fp8"],
+            default=ServerArgs.epv2_dispatcher_output_dtype,
+            help="Select DeepEP v2 dispatcher output dtype",
         )
         parser.add_argument(
             "--ep-num-redundant-experts",

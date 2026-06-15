@@ -18,6 +18,7 @@ from sglang.srt.layers.moe.moe_runner.base import (
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.moe.token_dispatcher.epv2 import EpV2DispatchOutput
     from sglang.srt.layers.moe.token_dispatcher.standard import (
         StandardCombineInput,
         StandardDispatchOutput,
@@ -244,4 +245,105 @@ def post_permute_triton_to_standard(
 
     return StandardCombineInput(
         hidden_states=runner_output.hidden_states,
+    )
+
+
+def _prepare_triton_runner_input(
+    hidden_states: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    quant_info: TritonMoeQuantInfo,
+    running_state: dict,
+) -> TritonRunnerInput:
+    from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
+        _prepare_fused_moe_run,
+    )
+
+    (
+        config,
+        down_config,
+        down_moe_use_tma,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+    ) = _prepare_fused_moe_run(
+        hidden_states,
+        quant_info.w13_weight,
+        quant_info.w2_weight,
+        topk_ids,
+        use_fp8_w8a8=quant_info.use_fp8_w8a8,
+        use_int8_w8a8=quant_info.use_int8_w8a8,
+        use_int8_w8a16=quant_info.use_int8_w8a16,
+        use_int4_w4a16=quant_info.use_int4_w4a16,
+        per_channel_quant=quant_info.per_channel_quant,
+        block_shape=quant_info.block_shape,
+    )
+    running_state["config"] = config
+    running_state["down_config"] = down_config
+    running_state["down_moe_use_tma"] = down_moe_use_tma
+    return TritonRunnerInput(
+        hidden_states=hidden_states,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        sorted_token_ids=sorted_token_ids,
+        expert_ids=expert_ids,
+        num_tokens_post_padded=num_tokens_post_padded,
+    )
+
+
+def _disable_triton_internal_routed_scale_for_ep(
+    runner_config: MoeRunnerConfig,
+) -> None:
+    # A2A EP combine inputs are kept unscaled. The model-level MoE forward
+    # applies the routed scaling factor once after combine.
+    runner_config.routed_scaling_factor = None
+
+
+@register_pre_permute("epv2", "triton")
+def pre_permute_epv2_to_triton(
+    dispatch_output: EpV2DispatchOutput,
+    quant_info: TritonMoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+    running_state: dict,
+) -> TritonRunnerInput:
+    hidden_states, hidden_states_scale, topk_ids, topk_weights, _ = dispatch_output
+    if hidden_states_scale is not None or hidden_states.dtype != torch.bfloat16:
+        raise RuntimeError(
+            "DeepEP v2 -> Triton expects BF16 dispatch output without activation scales. "
+            "Use --epv2-dispatcher-output-dtype bf16."
+        )
+    _disable_triton_internal_routed_scale_for_ep(runner_config)
+    valid_rows = (topk_ids >= 0).any(dim=1)
+    running_state["epv2_output_shape"] = hidden_states.shape
+    running_state["epv2_valid_rows"] = valid_rows
+    running_state["epv2_topk_ids"] = topk_ids
+    running_state["epv2_topk_weights"] = topk_weights
+    hidden_states = hidden_states[valid_rows].contiguous()
+    topk_ids = topk_ids[valid_rows].contiguous()
+    topk_weights = topk_weights[valid_rows].contiguous()
+    return _prepare_triton_runner_input(
+        hidden_states, topk_ids, topk_weights, quant_info, running_state
+    )
+
+
+@register_post_permute("triton", "epv2")
+def post_permute_triton_to_epv2(
+    runner_output: TritonRunnerOutput,
+    quant_info: TritonMoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+    running_state: dict,
+):
+    from sglang.srt.layers.moe.token_dispatcher.epv2 import EpV2CombineInput
+
+    valid_rows = running_state["epv2_valid_rows"]
+    output = torch.zeros(
+        running_state["epv2_output_shape"],
+        device=runner_output.hidden_states.device,
+        dtype=runner_output.hidden_states.dtype,
+    )
+    output[valid_rows] = runner_output.hidden_states
+    return EpV2CombineInput(
+        hidden_states=output,
+        topk_ids=running_state["epv2_topk_ids"],
+        topk_weights=running_state["epv2_topk_weights"],
     )

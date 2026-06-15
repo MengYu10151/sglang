@@ -36,6 +36,7 @@ class MoeA2ABackend(Enum):
     ASCEND_FUSEEP = "ascend_fuseep"
     FLASHINFER = "flashinfer"
     MEGAMOE = "megamoe"
+    EPV2 = "epv2"
     CUSTOMIZED = "customized"
 
     @classmethod
@@ -70,6 +71,9 @@ class MoeA2ABackend(Enum):
 
     def is_megamoe(self):
         return self == MoeA2ABackend.MEGAMOE
+
+    def is_epv2(self):
+        return self == MoeA2ABackend.EPV2
 
     def is_customized(self):
         return self == MoeA2ABackend.CUSTOMIZED
@@ -143,6 +147,18 @@ class MoeRunnerBackend(Enum):
 
     def is_aiter(self):
         return self == MoeRunnerBackend.AITER
+
+
+class EpV2OutputDtype(Enum):
+    """
+    Describes the dispatch output data type for DeepEP v2.
+
+    - BF16: dispatch hidden states in bf16, without activation scales.
+    - FP8: dispatch hidden states in fp8, with activation scales.
+    """
+
+    BF16 = "bf16"
+    FP8 = "fp8"
 
 
 class DeepEPMode(Enum):
@@ -244,6 +260,40 @@ def get_deepep_output_dtype(self) -> DeepEPOutputDtype:
 
     # 6. Default → FP8
     return DeepEPOutputDtype.FP8
+
+
+def get_epv2_output_dtype(self) -> EpV2OutputDtype:
+    """
+    Automatically choose the dispatch output dtype for DeepEP v2.
+
+    The decision follows several checks in priority order:
+    0. Parse server argument.
+    1. Parse quant config.
+    2. DeepGEMM expects FP8 activation + scales.
+    3. Triton consumes BF16 activation without dispatcher-provided scales.
+    """
+
+    server_args = get_global_server_args()
+    if server_args and server_args.epv2_dispatcher_output_dtype != "auto":
+        return EpV2OutputDtype(server_args.epv2_dispatcher_output_dtype)
+
+    if getattr(self, "quant_config", None) is not None:
+        dispatcher_output_dtype = self.quant_config.get("dispatcher_output_dtype", None)
+        if dispatcher_output_dtype is not None:
+            return EpV2OutputDtype(dispatcher_output_dtype)
+
+    runner_backend = get_moe_runner_backend()
+    if runner_backend.is_deep_gemm():
+        return EpV2OutputDtype.FP8
+    if runner_backend.is_triton():
+        return EpV2OutputDtype.BF16
+
+    raise ValueError(
+        "DeepEP v2 auto dispatcher output dtype only supports deep_gemm and triton "
+        f"runner backends for now, got {runner_backend.value}. Set "
+        "--epv2-dispatcher-output-dtype explicitly only after adding a matching "
+        "DeepEP v2 runner adapter."
+    )
 
 
 MOE_A2A_BACKEND: Optional[MoeA2ABackend] = None
@@ -368,6 +418,48 @@ def is_deepep_class_backend() -> bool:
     """Check if the MoE backend is DeepEP-family (DeepEP, Mooncake, or Mori)."""
     b = get_moe_a2a_backend()
     return b.is_deepep() or b.is_mooncake() or b.is_mori()
+
+
+def uses_a2a_moe_forward() -> bool:
+    """Return whether the active backend uses the A2A MoE forward path."""
+    b = get_moe_a2a_backend()
+    return (
+        b.is_deepep()
+        or b.is_mooncake()
+        or b.is_nixl()
+        or b.is_mori()
+        or b.is_ascend_fuseep()
+        or b.is_flashinfer()
+        or b.is_epv2()
+    )
+
+
+def uses_a2a_expert_parallel_metadata() -> bool:
+    """Return whether the backend needs EP metadata on DeepSeek MoE layers."""
+    b = get_moe_a2a_backend()
+    return (
+        b.is_deepep()
+        or b.is_mooncake()
+        or b.is_nixl()
+        or b.is_mori()
+        or b.is_ascend_fuseep()
+        or b.is_epv2()
+    )
+
+
+def requires_shared_expert_tp1() -> bool:
+    """Return whether shared experts should be materialized with TP=1."""
+    b = get_moe_a2a_backend()
+    return (
+        b.is_deepep()
+        or b.is_mooncake()
+        or b.is_nixl()
+        or b.is_mori()
+        or b.is_ascend_fuseep()
+        or b.is_flashinfer()
+        or b.is_megamoe()
+        or b.is_epv2()
+    )
 
 
 def is_flashinfer_cutedsl_v1_path() -> bool:

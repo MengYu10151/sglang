@@ -37,6 +37,10 @@ if TYPE_CHECKING:
         DeepEPNormalCombineInput,
         DeepEPNormalDispatchOutput,
     )
+    from sglang.srt.layers.moe.token_dispatcher.epv2 import (
+        EpV2CombineInput,
+        EpV2DispatchOutput,
+    )
     from sglang.srt.layers.moe.token_dispatcher.standard import (
         StandardCombineInput,
         StandardDispatchOutput,
@@ -937,3 +941,109 @@ def _apply_swiglu_limit(
     out = torch.cat([gate, up], dim=-1)
     assert out.shape == (num_tokens, hidden_size_x2)
     return out
+
+
+@register_pre_permute("epv2", "deep_gemm")
+def pre_permute_epv2_to_deep_gemm(
+    dispatch_output: EpV2DispatchOutput,
+    quant_info: DeepGemmMoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+    running_state: dict,
+) -> DeepGemmRunnerInput:
+    from sglang.srt.layers.moe.ep_moe.kernels import ep_scatter
+
+    (
+        hidden_states,
+        hidden_states_scale,
+        topk_ids,
+        topk_weights,
+        num_recv_tokens_per_expert,
+    ) = dispatch_output
+    if hidden_states_scale is None:
+        raise RuntimeError(
+            "DeepEP v2 -> DeepGEMM requires FP8 dispatch output with activation scales. "
+            "Use --epv2-dispatcher-output-dtype fp8 or select a BF16 runner such as triton."
+        )
+    assert runner_config.activation == "silu"
+
+    num_recv_tokens_per_expert = [
+        ceil_div(x, 128) * 128 for x in num_recv_tokens_per_expert
+    ]
+    all_tokens = sum(num_recv_tokens_per_expert)
+    K = hidden_states.shape[1]
+    running_state["all_tokens"] = all_tokens
+    running_state["hidden_states_shape"] = hidden_states.shape
+    running_state["hidden_states_device"] = hidden_states.device
+    running_state["hidden_states_dtype"] = hidden_states.dtype
+    running_state["topk_ids"] = topk_ids
+    running_state["topk_weights"] = topk_weights
+
+    input_tensor = torch.zeros(
+        (all_tokens, K), device=hidden_states.device, dtype=hidden_states.dtype
+    )
+    if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+        input_tensor_scale = torch.zeros(
+            (ceil_div(K // 128, 4), all_tokens),
+            device=hidden_states.device,
+            dtype=torch.int,
+        ).transpose(0, 1)
+    else:
+        input_tensor_scale = torch.zeros(
+            (all_tokens, K // 128), device=hidden_states.device, dtype=torch.float32
+        )
+    m_indices = torch.empty(all_tokens, device=hidden_states.device, dtype=torch.int32)
+    output_index = torch.empty_like(topk_ids)
+    num_recv_tokens_per_expert_gpu = torch.tensor(
+        num_recv_tokens_per_expert, dtype=torch.int32, pin_memory=True, device="cpu"
+    ).cuda(non_blocking=True)
+    expert_start_loc = torch.empty_like(num_recv_tokens_per_expert_gpu)
+
+    ep_scatter(
+        hidden_states,
+        hidden_states_scale,
+        topk_ids,
+        num_recv_tokens_per_expert_gpu,
+        expert_start_loc,
+        input_tensor,
+        input_tensor_scale,
+        m_indices,
+        output_index,
+        scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+    )
+    dispose_tensor(hidden_states)
+    dispose_tensor(hidden_states_scale)
+    running_state["output_index"] = output_index
+
+    return DeepGemmRunnerInput(
+        hidden_states=input_tensor,
+        hidden_states_scale=input_tensor_scale,
+        use_masked_gemm=False,
+        m_indices=m_indices,
+    )
+
+
+@register_post_permute("deep_gemm", "epv2")
+def post_permute_deep_gemm_to_epv2(
+    runner_output: DeepGemmRunnerOutput,
+    quant_info: DeepGemmMoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+    running_state: dict,
+) -> EpV2CombineInput:
+    from sglang.srt.layers.moe.ep_moe.kernels import ep_gather
+    from sglang.srt.layers.moe.token_dispatcher.epv2 import EpV2CombineInput
+
+    hidden_states = runner_output.hidden_states
+    topk_ids = running_state["topk_ids"]
+    topk_weights = running_state["topk_weights"]
+    output_index = running_state["output_index"]
+    gather_out = torch.empty(
+        running_state["hidden_states_shape"],
+        device=running_state["hidden_states_device"],
+        dtype=torch.bfloat16,
+    )
+    ep_gather(hidden_states, topk_ids, topk_weights, output_index, gather_out)
+    return EpV2CombineInput(
+        hidden_states=gather_out,
+        topk_ids=topk_ids,
+        topk_weights=topk_weights,
+    )

@@ -568,6 +568,8 @@ class Envs:
     # DeepEP
     SGLANG_DEEPEP_BF16_DISPATCH = EnvBool(False) # This argument is deprecated
     SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
+    SGLANG_EPV2_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
+    SGLANG_EPV2_ALLOW_HYBRID_MODE = EnvBool(False)
     SGLANG_DEEPEP_LL_COMBINE_SEND_NUM_SMS = EnvInt(32)
     SGLANG_BLACKWELL_OVERLAP_SHARED_EXPERTS_OUTSIDE_SBO = EnvBool(False)
     # Force dynamic DeepEP Waterfill with runtime EP all-reduce instead of the
