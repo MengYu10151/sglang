@@ -40,6 +40,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher.ncclep import (
         NcclEpHighThroughputCombineInput,
         NcclEpHighThroughputDispatchOutput,
+        NcclEpHighThroughputExpertMajorDispatchOutput,
         NcclEpLowLatencyCombineInput,
         NcclEpLowLatencyDispatchOutput,
     )
@@ -65,6 +66,7 @@ else:
 
 _MASKED_GEMM_FAST_ACT = get_bool_env_var("SGLANG_MASKED_GEMM_FAST_ACT")
 _DEEPGEMM_ON_H20 = get_bool_env_var("SGLANG_DEEPGEMM_ON_H20")
+_NCCLEP_HT_EXPERT_ALIGNMENT = 128
 
 
 # TODO(kaixih@nvidia): ideally we should merge this logic into
@@ -90,6 +92,47 @@ def copy_list_to_gpu_no_ce(arr: List[int]):
     tensor_gpu = torch.empty_like(tensor_cpu, device="cuda")
     copy_to_gpu_no_ce(tensor_cpu, tensor_gpu)
     return tensor_gpu
+
+
+def _fill_ncclep_expert_major_m_indices(
+    num_recv_tokens_per_expert: List[int],
+    counts_gpu: torch.Tensor,
+    all_tokens: int,
+) -> torch.Tensor:
+    if all_tokens == 0:
+        return torch.empty(0, device=counts_gpu.device, dtype=torch.int32)
+
+    m_indices = torch.empty(all_tokens, device=counts_gpu.device, dtype=torch.int32)
+    can_use_ep_kernel = all(
+        x % _NCCLEP_HT_EXPERT_ALIGNMENT == 0 for x in num_recv_tokens_per_expert
+    )
+    if can_use_ep_kernel:
+        import triton
+
+        from sglang.srt.layers.moe.ep_moe.kernels import _fwd_kernel_ep_scatter_1
+
+        expert_start_loc = torch.empty_like(counts_gpu)
+        num_experts = len(num_recv_tokens_per_expert)
+        _fwd_kernel_ep_scatter_1[(num_experts,)](
+            counts_gpu,
+            expert_start_loc,
+            m_indices,
+            num_experts=num_experts,
+            num_warps=8,
+            BLOCK_E=_NCCLEP_HT_EXPERT_ALIGNMENT,
+            BLOCK_EXPERT_NUM=triton.next_power_of_2(num_experts),
+        )
+        return m_indices
+
+    return torch.repeat_interleave(
+        torch.arange(
+            len(num_recv_tokens_per_expert),
+            device=counts_gpu.device,
+            dtype=torch.int32,
+        ),
+        counts_gpu,
+        output_size=all_tokens,
+    )
 
 
 @dataclass
@@ -1001,6 +1044,56 @@ def pre_permute_ncclep_high_throughput_to_deep_gemm(
     running_state: dict,
 ) -> DeepGemmRunnerInput:
     from sglang.srt.layers.moe.ep_moe.kernels import ep_scatter
+    from sglang.srt.layers.moe.token_dispatcher.ncclep import (
+        NcclEpHighThroughputExpertMajorDispatchOutput,
+    )
+
+    if isinstance(dispatch_output, NcclEpHighThroughputExpertMajorDispatchOutput):
+        (
+            hidden_states,
+            hidden_states_scale,
+            topk_weights,
+            num_recv_tokens_per_expert,
+            expert_offsets,
+            _,
+        ) = dispatch_output
+        if hidden_states_scale is None:
+            raise RuntimeError(
+                "NCCL_EP high_throughput expert-major -> DeepGEMM requires FP8 "
+                "dispatch output with activation scales."
+            )
+        assert runner_config.activation == "silu"
+
+        all_tokens = sum(num_recv_tokens_per_expert)
+        K = hidden_states.shape[1]
+        input_tensor = hidden_states[:all_tokens]
+        input_tensor_scale = hidden_states_scale[:all_tokens]
+        counts_gpu = torch.tensor(
+            num_recv_tokens_per_expert,
+            dtype=torch.int32,
+            device=hidden_states.device,
+        )
+        m_indices = _fill_ncclep_expert_major_m_indices(
+            num_recv_tokens_per_expert,
+            counts_gpu,
+            all_tokens,
+        )
+
+        running_state["ncclep_ht_expert_major"] = True
+        running_state["all_tokens"] = all_tokens
+        running_state["hidden_states_shape"] = hidden_states.shape
+        running_state["hidden_states_device"] = hidden_states.device
+        running_state["hidden_states_dtype"] = hidden_states.dtype
+        running_state["topk_weights"] = topk_weights
+        running_state["num_recv_tokens_per_expert"] = num_recv_tokens_per_expert
+        running_state["expert_offsets"] = expert_offsets
+
+        return DeepGemmRunnerInput(
+            hidden_states=input_tensor,
+            hidden_states_scale=input_tensor_scale,
+            use_masked_gemm=False,
+            m_indices=m_indices,
+        )
 
     (
         hidden_states,
@@ -1092,6 +1185,20 @@ def post_permute_deep_gemm_to_ncclep_high_throughput(
     )
 
     hidden_states = runner_output.hidden_states
+    if running_state.get("ncclep_ht_expert_major", False):
+        all_tokens = running_state["all_tokens"]
+        topk_weights = running_state["topk_weights"]
+        combine_input = torch.empty(
+            running_state["hidden_states_shape"],
+            device=running_state["hidden_states_device"],
+            dtype=torch.bfloat16,
+        )
+        if all_tokens > 0:
+            combine_input[:all_tokens] = hidden_states[:all_tokens] * topk_weights[
+                :all_tokens
+            ].to(torch.float32).reshape(-1, 1)
+        return NcclEpHighThroughputCombineInput(hidden_states=combine_input)
+
     topk_ids = running_state["topk_ids"]
     topk_weights = running_state["topk_weights"]
     output_index = running_state["output_index"]

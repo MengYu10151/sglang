@@ -121,6 +121,7 @@ try:
         DispatchOutputs,
         Group,
         GroupConfig,
+        HandleConfig,
         Layout,
         LayoutInfo,
         PassDir,
@@ -146,6 +147,19 @@ class NcclEpHighThroughputDispatchOutput(NamedTuple):
         return DispatchOutputFormat.NCCL_EP_HT
 
 
+class NcclEpHighThroughputExpertMajorDispatchOutput(NamedTuple):
+    hidden_states: torch.Tensor
+    hidden_states_scale: Optional[torch.Tensor]
+    topk_weights: torch.Tensor
+    num_recv_tokens_per_expert: List[int]
+    expert_offsets: torch.Tensor
+    max_recv_tokens: int
+
+    @property
+    def format(self) -> DispatchOutputFormat:
+        return DispatchOutputFormat.NCCL_EP_HT
+
+
 class NcclEpLowLatencyDispatchOutput(NamedTuple):
     hidden_states: torch.Tensor
     hidden_states_scale: Optional[torch.Tensor]
@@ -160,6 +174,7 @@ class NcclEpLowLatencyDispatchOutput(NamedTuple):
 
 
 assert isinstance(NcclEpHighThroughputDispatchOutput, DispatchOutput)
+assert isinstance(NcclEpHighThroughputExpertMajorDispatchOutput, DispatchOutput)
 assert isinstance(NcclEpLowLatencyDispatchOutput, DispatchOutput)
 
 
@@ -443,17 +458,26 @@ class _NcclEpHighThroughputImpl(_NcclEpImplBase):
         self._recv_topk_ids: Optional[torch.Tensor] = None
         self._recv_topk_weights: Optional[torch.Tensor] = None
         self._expert_counters: Optional[torch.Tensor] = None
+        self._expert_offsets: Optional[torch.Tensor] = None
         self._recv_total_counter: Optional[torch.Tensor] = None
         self._num_recv_tokens = 0
         self._num_input_tokens = 0
+        self._recv_layout_expert_major: Optional[bool] = None
+
+    def _is_expert_major(self) -> bool:
+        return self._uses_fp8_dispatch_output()
 
     def set_output_dtype(self, output_dtype: NcclEpOutputDtype) -> None:
         if self.output_dtype != output_dtype:
             super().set_output_dtype(output_dtype)
             self._recv_tokens = None
             self._recv_scales = None
+            self._recv_topk_ids = None
+            self._recv_topk_weights = None
+            self._recv_layout_expert_major = None
 
     def _ensure_buffers(self, max_recv_tokens: int) -> None:
+        expert_major = self._is_expert_major()
         token_dtype = (
             torch.float8_e4m3fn if self._uses_fp8_dispatch_output() else torch.bfloat16
         )
@@ -461,6 +485,7 @@ class _NcclEpHighThroughputImpl(_NcclEpImplBase):
             self._recv_tokens is not None
             and self._recv_tokens.shape[0] >= max_recv_tokens
             and self._recv_tokens.dtype == token_dtype
+            and self._recv_layout_expert_major == expert_major
         ):
             return
         self._recv_tokens = torch.empty(
@@ -476,27 +501,48 @@ class _NcclEpHighThroughputImpl(_NcclEpImplBase):
             )
         else:
             self._recv_scales = None
-        self._recv_topk_ids = torch.empty(
-            (max_recv_tokens, self.router_topk), dtype=torch.int64, device="cuda"
-        )
-        self._recv_topk_weights = torch.empty(
-            (max_recv_tokens, self.router_topk), dtype=torch.float32, device="cuda"
-        )
+        if expert_major:
+            self._recv_topk_ids = None
+            self._recv_topk_weights = torch.empty(
+                max_recv_tokens, dtype=torch.float32, device="cuda"
+            )
+        else:
+            self._recv_topk_ids = torch.empty(
+                (max_recv_tokens, self.router_topk), dtype=torch.int64, device="cuda"
+            )
+            self._recv_topk_weights = torch.empty(
+                (max_recv_tokens, self.router_topk),
+                dtype=torch.float32,
+                device="cuda",
+            )
         self._expert_counters = torch.zeros(
             self.num_local_experts, dtype=torch.int32, device="cuda"
         )
+        self._expert_offsets = torch.zeros(
+            self.num_local_experts, dtype=torch.int32, device="cuda"
+        )
         self._recv_total_counter = torch.zeros(1, dtype=torch.int32, device="cuda")
+        self._recv_layout_expert_major = expert_major
 
-    def _bind_handle(self, ep_group, topk_ids: torch.Tensor) -> None:
+    def _bind_handle(
+        self,
+        ep_group,
+        topk_ids: torch.Tensor,
+        layout_info: Optional["LayoutInfo"] = None,
+        handle_config: Optional["HandleConfig"] = None,
+    ) -> None:
         topk_tensor = Tensor(topk_ids)
+        layout = Layout.EXPERT_MAJOR if self._is_expert_major() else Layout.FLAT
         if self._handle is None:
             self._handle = ep_group.create_handle(
-                Layout.FLAT,
+                layout,
                 topk_tensor,
+                layout_info=layout_info,
+                config=handle_config,
                 stream=_stream(),
             )
         else:
-            self._handle.update(topk_tensor, stream=_stream())
+            self._handle.update(topk_tensor, layout_info=layout_info, stream=_stream())
 
     def dispatch(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
         topk_weights = topk_output.topk_weights
@@ -516,15 +562,37 @@ class _NcclEpHighThroughputImpl(_NcclEpImplBase):
         max_recv_tokens = self.max_recv_tokens_per_rank
         self._ensure_buffers(max_recv_tokens)
         self._expert_counters.zero_()
+        self._expert_offsets.zero_()
         self._recv_total_counter.zero_()
         self._recv_tokens.zero_()
         if self._recv_scales is not None:
             self._recv_scales.zero_()
-        self._recv_topk_ids.fill_(-1)
+        if self._recv_topk_ids is not None:
+            self._recv_topk_ids.fill_(-1)
         self._recv_topk_weights.zero_()
 
-        layout_info = LayoutInfo(expert_counters=Tensor(self._expert_counters))
-        self._bind_handle(ep_group, topk_ids)
+        layout_info = LayoutInfo(
+            expert_counters=Tensor(self._expert_counters),
+            **(
+                {
+                    "expert_offsets": Tensor(self._expert_offsets),
+                    "recv_total_counter": Tensor(self._recv_total_counter),
+                }
+                if self._is_expert_major()
+                else {}
+            ),
+        )
+        handle_config = (
+            HandleConfig(dispatch_output_per_expert_alignment=128)
+            if self._is_expert_major()
+            else None
+        )
+        self._bind_handle(
+            ep_group,
+            topk_ids,
+            layout_info=layout_info if self._is_expert_major() else None,
+            handle_config=handle_config,
+        )
 
         dispatch_inputs = DispatchInputs(
             tokens=Tensor(q_hidden_states),
@@ -538,7 +606,11 @@ class _NcclEpHighThroughputImpl(_NcclEpImplBase):
         dispatch_outputs = DispatchOutputs(
             tokens=Tensor(self._recv_tokens),
             topk_weights=Tensor(self._recv_topk_weights),
-            topk_idx=Tensor(self._recv_topk_ids),
+            **(
+                {"topk_idx": Tensor(self._recv_topk_ids)}
+                if self._recv_topk_ids is not None
+                else {}
+            ),
             **(
                 {"scales": Tensor(self._recv_scales)}
                 if self._recv_scales is not None
@@ -554,6 +626,22 @@ class _NcclEpHighThroughputImpl(_NcclEpImplBase):
         )
         self._handle.complete(stream=_stream())
         torch.cuda.synchronize()
+
+        if self._is_expert_major():
+            counts = [int(x) for x in self._expert_counters.cpu().tolist()]
+            self._num_recv_tokens = max_recv_tokens
+            return NcclEpHighThroughputExpertMajorDispatchOutput(
+                self._recv_tokens[: self._num_recv_tokens],
+                (
+                    self._recv_scales[: self._num_recv_tokens]
+                    if self._recv_scales is not None
+                    else None
+                ),
+                self._recv_topk_weights[: self._num_recv_tokens],
+                counts,
+                self._expert_offsets,
+                self._num_recv_tokens,
+            )
 
         reported_recv = int(self._expert_counters.sum().item())
         valid_rows = (self._recv_topk_ids >= 0).any(dim=1)
