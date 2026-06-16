@@ -1,25 +1,24 @@
-# DeepEP v2 / EPv2 SGLang Integration
+# DeepEP v2 / EPv2 SGLang 集成说明
 
-This branch adds an independent DeepEP v2 MoE all-to-all backend to SGLang.
-The backend is exposed as `epv2` and is intentionally separate from the legacy
-`deepep` backend. It should not reuse DeepEP v1 dispatcher objects or mode
-semantics.
+这个分支在 SGLang 中新增了独立的 DeepEP v2 MoE all-to-all 后端。
+后端名是 `epv2`，语义上与已有的 legacy `deepep` 后端分离，不复用
+DeepEP v1 的 dispatcher 对象、mode 语义或 dispatch/combine 数据结构。
 
-## Scope
+## 集成范围
 
-- Add `--moe-a2a-backend epv2` for MoE expert-parallel dispatch and combine.
-- Wrap DeepEP v2 `ElasticBuffer` through a new SGLang dispatcher.
-- Keep EPv2 mode semantics explicit with `--epv2-mode {direct,hybrid}`.
-- Keep dispatcher output dtype explicit or auto-selected with
-  `--epv2-dispatcher-output-dtype {auto,bf16,fp8}`.
-- Support the runner paths that currently have matching adapters:
-  DeepGEMM with FP8 activation dispatch and Triton with BF16 activation dispatch.
+- 新增 `--moe-a2a-backend epv2`，用于 MoE expert-parallel dispatch/combine。
+- 通过新的 SGLang dispatcher 封装 DeepEP v2 `ElasticBuffer`。
+- 通过 `--epv2-mode {direct,hybrid}` 显式选择 DeepEP v2 direct/hybrid 模式。
+- 通过 `--epv2-dispatcher-output-dtype {auto,bf16,fp8}` 显式或自动选择 dispatcher 输出 dtype。
+- 当前只启用已经补齐 adapter 的 MoE runner：
+  - DeepGEMM + FP8 activation dispatch
+  - Triton + BF16 activation dispatch
 
-This branch does not contain NCCL_EP integration code.
+这个分支不包含 NCCL_EP 集成内容。
 
-## Runtime Interface
+## Runtime 接口
 
-### Required backend option
+### 必选后端参数
 
 ```bash
 --moe-a2a-backend epv2
@@ -32,10 +31,10 @@ This branch does not contain NCCL_EP integration code.
 --epv2-mode hybrid
 ```
 
-`direct` and `hybrid` map to DeepEP v2 `ElasticBuffer(allow_hybrid_mode=...)`.
-They are independent from legacy DeepEP `--deepep-mode normal/low_latency`.
+`direct` / `hybrid` 对应 DeepEP v2 `ElasticBuffer(allow_hybrid_mode=...)`。
+这套语义独立于 legacy DeepEP 的 `--deepep-mode normal/low_latency/auto`。
 
-### Dispatcher output dtype
+### Dispatcher 输出 dtype
 
 ```bash
 --epv2-dispatcher-output-dtype auto
@@ -43,78 +42,77 @@ They are independent from legacy DeepEP `--deepep-mode normal/low_latency`.
 --epv2-dispatcher-output-dtype bf16
 ```
 
-`auto` currently resolves by MoE runner:
+当前 `auto` 按 MoE runner capability 选择：
 
 - `deep_gemm` -> `fp8`
 - `triton` -> `bf16`
 
-Explicit dtype is allowed only when a matching runner adapter exists.
-Unsupported combinations fail fast during server argument validation or runner
-capability selection.
+只有已经实现 adapter 的 runner/dtype 组合可以使用。其他组合会在启动或
+capability 解析阶段 fail-fast，避免静默进入错误 layout 或 scale 语义。
 
-### Environment variables
+### 环境变量
 
 ```bash
 SGLANG_EPV2_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128
 SGLANG_EPV2_ALLOW_HYBRID_MODE=0
 SGLANG_DEEPEP_ALLOW_MNNVL=1
+NVSHMEM_DISABLE_CUDA_VMM=0
 ```
 
-`SGLANG_EPV2_NUM_MAX_DISPATCH_TOKENS_PER_RANK` is a per-rank EPv2
-communication buffer capacity. It is not a model semantic token limit. Large
-prefill, chunked-prefill, or high-concurrency decode workloads may need a larger
-value such as `1024`.
+`SGLANG_EPV2_NUM_MAX_DISPATCH_TOKENS_PER_RANK` 是每个 rank 的 EPv2 通信
+buffer capacity，不是模型语义上的 token limit。大 prefill、chunked-prefill
+或高并发 decode 场景可能需要设置为 `1024` 或更高。
 
-`SGLANG_EPV2_ALLOW_HYBRID_MODE` is only a compatibility fallback for synthetic
-or unit tests that instantiate the dispatcher without `ServerArgs`. Server runs
-should use `--epv2-mode`.
+`SGLANG_EPV2_ALLOW_HYBRID_MODE` 只用于兼容不带 `ServerArgs` 直接构造 dispatcher
+的 synthetic/unit test。真实 server 启动应使用 `--epv2-mode`。
 
-`SGLANG_DEEPEP_ALLOW_MNNVL` belongs to the legacy DeepEP baseline path. It is
-kept in this branch because the fair DeepEP baseline on H20-like environments
-may need to disable fabric memory handles, but it is not an EPv2 option.
+`SGLANG_DEEPEP_ALLOW_MNNVL` 属于 legacy DeepEP baseline 路径，不是 EPv2 参数。
+它保留在这个分支里，是因为 H20 类环境在做公平 DeepEP baseline 对比时，可能
+需要关闭不可用的 fabric memory handle。
 
-## Supported Matrix
+`NVSHMEM_DISABLE_CUDA_VMM=0` 也是 legacy DeepEP baseline 的环境要求。H20 上
+DeepEP low_latency 曾经能稳定通过；后来 bench/profile 脚本把该变量默认成 `1`，
+会在 legacy DeepEP LL buffer 初始化阶段触发 `cudaErrorInvalidValue`。复测 DeepEP
+LL decode baseline 时需要显式设为 `0`。EPv2 direct 本身不依赖这个 baseline 规避项。
 
-| MoE runner | EPv2 output dtype | Status | Notes |
+## 支持矩阵
+
+| MoE runner | EPv2 output dtype | 状态 | 说明 |
 | --- | --- | --- | --- |
-| `deep_gemm` | `fp8` | Supported | Dispatcher returns FP8 activation plus scale. Adapter uses 128-token expert alignment and DeepGEMM scale layout. |
-| `triton` | `bf16` | Supported | Dispatcher returns BF16 activation without scale. Adapter compacts valid rows before Triton and expands them before EPv2 combine. |
-| `deep_gemm` | `bf16` | Rejected | Current DeepGEMM adapter expects FP8 activation and scale. |
-| `triton` | `fp8` | Rejected | Current Triton adapter expects BF16 activation and no dispatcher scale. |
-| Other runners | Any | Rejected | Add an explicit runner adapter and capability contract before enabling. |
+| `deep_gemm` | `fp8` | 支持 | Dispatcher 返回 FP8 activation 和 scale；adapter 使用 128-token expert alignment 与 DeepGEMM scale layout。 |
+| `triton` | `bf16` | 支持 | Dispatcher 返回 BF16 activation，不返回 scale；adapter 在 Triton 前 compact valid rows，在 combine 前 expand 回 EPv2 layout。 |
+| `deep_gemm` | `bf16` | 拒绝 | 当前 DeepGEMM adapter 要求 FP8 activation + scale。 |
+| `triton` | `fp8` | 拒绝 | 当前 Triton adapter 要求 BF16 activation，且不消费 dispatcher scale。 |
+| 其他 runner | 任意 | 拒绝 | 需要先补显式 runner adapter 和 capability contract。 |
 
-## Implementation Map
+## 代码结构
 
 - `python/sglang/srt/layers/moe/token_dispatcher/epv2.py`
-  - Defines EPv2 dispatch/combine input and output containers.
-  - Owns EPv2 stage checks, capacity checks, hidden-size checks, top-k checks,
-    dispatch output quantization, and `ElasticBuffer` calls.
-  - Uses a dedicated singleton buffer key that includes process group,
-    hidden size, top-k, capacity, FP8/BF16 output mode, hybrid/direct mode, and
-    world size.
+  - 定义 EPv2 专属 dispatch/combine input/output 类型。
+  - 负责 stage 检查、capacity 检查、hidden size 检查、top-k 检查、dispatch 输出量化，以及 `ElasticBuffer` 调用。
+  - 使用专属 singleton buffer key，key 包含 process group、hidden size、top-k、capacity、FP8/BF16 输出模式、direct/hybrid mode 和 world size。
 - `python/sglang/srt/layers/moe/utils.py`
-  - Adds `MoeA2ABackend.EPV2`.
-  - Defines `EpV2OutputDtype` and `EpV2RunnerCapability`.
-  - Resolves EPv2 runner capability from server args and MoE runner backend.
+  - 新增 `MoeA2ABackend.EPV2`。
+  - 定义 `EpV2OutputDtype` 和 `EpV2RunnerCapability`。
+  - 根据 server args 和 MoE runner backend 解析 EPv2 runner capability。
 - `python/sglang/srt/layers/moe/moe_runner/deep_gemm.py`
-  - Adds EPv2 -> DeepGEMM pre-permute and DeepGEMM -> EPv2 post-permute.
-  - Consumes EPv2 FP8 activation and scale directly.
+  - 新增 EPv2 -> DeepGEMM pre-permute 与 DeepGEMM -> EPv2 post-permute。
+  - 直接消费 EPv2 FP8 activation 和 scale。
 - `python/sglang/srt/layers/moe/moe_runner/triton.py`
-  - Adds EPv2 -> Triton pre-permute and Triton -> EPv2 post-permute.
-  - Handles BF16 valid-row compaction and expansion.
+  - 新增 EPv2 -> Triton pre-permute 与 Triton -> EPv2 post-permute。
+  - 处理 BF16 valid-row compaction/expansion。
 - `python/sglang/srt/layers/moe/fused_moe_triton/layer.py`
-  - Selects `EpV2Dispatcher` when `--moe-a2a-backend epv2` is used.
+  - 当 `--moe-a2a-backend epv2` 时创建 `EpV2Dispatcher`。
 - `python/sglang/srt/models/deepseek_v2.py`
-  - Routes MoE forward through the generic all-to-all MoE helper for EPv2.
+  - 让 EPv2 走通用 A2A MoE forward helper。
 - `python/sglang/srt/server_args.py`
-  - Adds CLI arguments and fail-fast checks for unsupported EPv2 runtime
-    features.
+  - 新增 CLI 参数和不支持功能的 fail-fast 检查。
 - `python/sglang/srt/environ.py`
-  - Adds EPv2 buffer capacity and hybrid-mode fallback environment variables.
+  - 新增 EPv2 capacity 与 hybrid fallback 环境变量。
 
-## Example Server Commands
+## 示例启动命令
 
-### DeepGEMM FP8, prefill-like EPv2 hybrid
+### DeepGEMM FP8，prefill-like EPv2 hybrid
 
 ```bash
 SGLANG_EPV2_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024 \
@@ -130,7 +128,7 @@ python3 -m sglang.launch_server \
   --disable-cuda-graph --disable-piecewise-cuda-graph
 ```
 
-### DeepGEMM FP8, decode-like EPv2 direct
+### DeepGEMM FP8，decode-like EPv2 direct
 
 ```bash
 SGLANG_EPV2_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024 \
@@ -146,7 +144,7 @@ python3 -m sglang.launch_server \
   --disable-cuda-graph --disable-piecewise-cuda-graph
 ```
 
-### Triton BF16 smoke path
+### Triton BF16 smoke 路径
 
 ```bash
 SGLANG_EPV2_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024 \
@@ -161,28 +159,28 @@ python3 -m sglang.launch_server \
   --kv-cache-dtype fp8_e4m3 \
   --disable-cuda-graph --disable-piecewise-cuda-graph
 ```
-## Validation Summary
 
-The latest validation was run on the H20 8-GPU node under the privileged
-`sglang_deepep_epv2_menyu` container with DSv4 Flash FP8.
+## 验证情况
 
-Basic checks completed:
+最近一次验证在 H20 8 卡节点的 privileged container `sglang_deepep_epv2_menyu`
+中完成，模型为 DSv4 Flash FP8。
+
+已完成的基础检查：
 
 - `git diff --check`
-- Python compile checks for touched SGLang files.
-- EPv2 import and capability resolution inside the runtime container.
-- E2E prompt checks for DeepGEMM FP8 and Triton BF16 paths, including factual,
-  arithmetic, and translation prompts.
-- Fail-fast checks for unsupported EPv2 runner/dtype combinations and overlap
-  features.
-- Synthetic dispatcher capacity guard checks.
+- 修改文件的 Python compile 检查。
+- runtime container 内 EPv2 import 和 capability resolution 检查。
+- DeepGEMM FP8 与 Triton BF16 路径的 E2E prompt 检查，包括事实、算术和翻译类 prompt。
+- 不支持 runner/dtype 组合和 overlap 功能的 fail-fast 检查。
+- synthetic dispatcher capacity guard 检查。
 
-Representative performance results with fair capacity alignment are below.
-Both DeepEP and EPv2 used the same model, runner, DP-attention setting, disabled
-CUDA graph, disabled TBO/SBO, `max_prefill_tokens=8192`, and
-`SGLANG_*_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024` unless noted.
+## 性能结果摘要
 
-### Prefill-like: ISL=1024, OSL=1
+以下结果使用公平 capacity 对齐方式复测。DeepEP 与 EPv2 使用相同模型、runner、
+DP-attention 设置，均关闭 CUDA graph 与 TBO/SBO，`max_prefill_tokens=8192`，
+且除特别说明外都设置 `SGLANG_*_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024`。
+
+### Prefill-like：ISL=1024，OSL=1
 
 | Backend | Mode | CC | Input tok/s | Output tok/s | Mean TTFT |
 | --- | --- | ---: | ---: | ---: | ---: |
@@ -191,61 +189,127 @@ CUDA graph, disabled TBO/SBO, `max_prefill_tokens=8192`, and
 | DeepEP | normal | 128 | 25839.65 | 25.23 | 3039.61 ms |
 | EPv2 | hybrid | 128 | 24958.80 | 24.37 | 3168.68 ms |
 
-EPv2 hybrid was functional and close to DeepEP normal, about 3-4% slower in this
-prefill-like test.
+结论：EPv2 hybrid 可以稳定运行，prefill-like 场景与 DeepEP normal 同量级，
+当前约慢 3% 到 4%。
 
-### Decode-like: ISL=1, OSL=1024
+### Decode-like：ISL=1，OSL=1024
 
-| Backend | Mode | Capacity | CC | Output tok/s | Mean TPOT | Mean TTFT | Status |
+| Backend | Mode | Capacity | CC | Output tok/s | Mean TPOT | Mean TTFT | 状态 |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
 | DeepEP | low_latency | 128 | 64 | 486.89 | 130.54 ms | 1025.37 ms | PASS |
 | EPv2 | direct | 128 | 64 | 386.18 | 164.61 ms | 1244.02 ms | PASS |
-| DeepEP | low_latency | 128 | 128 | - | - | - | FAIL, capacity assert |
-| EPv2 | direct | 128 | 128 | - | - | - | FAIL, capacity guard |
+| DeepEP | low_latency | 128 | 128 | - | - | - | FAIL，capacity assert |
+| EPv2 | direct | 128 | 128 | - | - | - | FAIL，capacity guard |
 | DeepEP | low_latency | 1024 | 64 | 231.47 | 275.11 ms | 1517.50 ms | PASS |
 | EPv2 | direct | 1024 | 64 | 378.46 | 168.10 ms | 1163.30 ms | PASS |
-| DeepEP | low_latency | 1024 | 128 | 441.15 | 283.87 ms | 1810.45 ms | PASS |
-| EPv2 | direct | 1024 | 128 | 730.17 | 170.77 ms | 1319.88 ms | PASS |
+| DeepEP | low_latency | 1024 | 128 | 441.15 | 283.87 ms | 1810.45 ms | PASS，旧 wrapper：`SGLANG_OPT_SWIGLU_CLAMP_FUSION=false` |
+| DeepEP | low_latency | 1024 | 128 | 953.93 | 129.27 ms | 1796.47 ms | PASS，corrected baseline：`SGLANG_OPT_SWIGLU_CLAMP_FUSION=true` |
+| EPv2 | direct | 1024 | 128 | 730.17 | 170.77 ms | 1319.88 ms | PASS，当前默认路径 |
+| EPv2 | direct | 1024 | 128 | 774.37 | 160.88 ms | 1255.55 ms | PASS，实验方案 2：BF16 dispatch + masked DeepGEMM preprocess，本地重新量化 |
+| EPv2 | direct | 1024 | 128 | 760.72 | 163.76 ms | 1278.87 ms | PASS，实验方案 1：FP8 dispatch + fused contiguous activation + empty-token guard |
 
-Capacity materially changes both correctness and performance. At CC=128 the
-runtime can issue larger MoE dispatch batches than the nominal single decode
-step, so capacity 128 is not sufficient. With capacity aligned to 1024, EPv2
-direct was faster than DeepEP low_latency in this decode-like test.
+结论：capacity 对正确性和性能都有明显影响。CC=128 时 runtime 可能发出比单步
+decode 更大的 MoE dispatch batch，因此 capacity=128 不足。capacity 对齐为 1024 后，
+如果 DeepEP LL 使用旧 wrapper 里的 `SGLANG_OPT_SWIGLU_CLAMP_FUSION=false`，EPv2 direct 更快；
+但 corrected DeepEP LL baseline 使用 `SGLANG_OPT_SWIGLU_CLAMP_FUSION=true` 后，DeepEP LL
+当前快于 EPv2 direct。后续 decode 对比必须同时标注 capacity、VMM 和 swiglu clamp fusion。
 
-Detailed logs and iteration notes are kept outside the source tree under:
+补充实验结论：方案 2 通过 BF16 dispatch 后重新进入 masked DeepGEMM preprocess，性能略高于当前默认 EPv2 direct，但引入本地二次量化和额外 adapter 语义，不适合作为优先产品化方向。方案 1 保持 FP8 dispatch，方向更干净，但当前需要补 empty-token rank guard 才能避免 `silu_and_mul_contig_post_quant` 对 `num_tokens=0` launch 时报 `CUDA error: invalid argument`，且性能仍低于 corrected DeepEP LL。
+
+详细过程和日志保存在源码树外：
 
 ```text
 /root/menyu/comm_docs/epv2/progress.md
 /root/menyu/logs/deepep_epv2_menyu_bench_*
 ```
 
-## Known Limitations
+## Timeline profiling 状态与当前瓶颈判断
 
-- EPv2 currently supports only the DeepGEMM FP8 and Triton BF16 runner adapters.
-- TBO and SBO overlap hooks are not implemented for EPv2 and are rejected at
-  launch time.
-- CUDA graph is disabled for EPv2 until graph-capture safety is validated.
-- Shared expert fusion is disabled for EPv2 until the fused path is validated.
-- E2E capacity boundary testing is not deterministic enough yet because SGLang
-  scheduling, tokenization, and chunked-prefill logic can handle requests before
-  they reach dispatcher capacity. Synthetic dispatcher capacity tests are used
-  for now, but a stronger in-server instrumentation test is still needed.
-- The current EPv2 buffer is a singleton with a detailed key. Multi-model or
-  dynamic multi-config serving should move toward explicit per-key buffer
-  lifecycle management.
-- `_to_local_topk_ids` currently relies on the existing global/local expert-id
-  range convention. This should be formalized against the DeepEP v2 API contract.
-- DeepEP v2 direct/hybrid mode is selected for the server lifetime. There is no
-  DeepEP v1-style automatic normal/low_latency switching in this branch.
+已补齐 H20 8 卡、DSv4 Flash FP8、DeepGEMM runner、DP attention、关闭 CUDA graph
+和 TBO/SBO 条件下的 torch profiler 对比。trace 与 bench 日志保存在：
 
-## Next Optimization Items
+```text
+/root/menyu/logs/deepep_epv2_torch_profile_warm_20260616_175003/
+/root/menyu/logs/deepep_epv2_torch_profile_warm_decode_epv2_180505/
+/root/menyu/logs/deepep_epv2_torch_profile_warm_decode_deepep_vmm0_214145/
+/root/menyu/logs/deepep_epv2_menyu_bench_*
+```
 
-- Compare DeepEP v2 and DeepEP v1 timelines at the dispatcher, communication,
-  and MoE runner boundaries.
-- Audit `ElasticBuffer`, workspace, and handle lifecycle overhead.
-- Test whether `do_cpu_sync=False` is valid for the supported EPv2 paths.
-- Replace singleton buffer handling with explicit per-key lifetime management.
-- Extend the runner capability contract before enabling FlashInfer, Cutlass, or
-  other MoE runners.
-- Add deterministic E2E capacity instrumentation so capacity behavior can be
-  validated inside real server execution rather than only by synthetic tests.
+### Prefill-like profiling：DeepEP normal vs EPv2 hybrid
+
+测试条件：`ISL=1024, OSL=1, CC=128, capacity=1024`。
+非 profiler 性能：DeepEP normal 约 `25.23 tok/s`，EPv2 hybrid 约 `24.37 tok/s`，
+EPv2 慢约 3% 到 4%。
+
+profile 结论：
+
+- DeepGEMM 和 attention 基本同量级，不是主要差距来源。
+- raw trace 里两边都有 long-running/waiting 型 EP dispatch kernel；不能把该 kernel 的
+  trace duration 直接理解成纯计算时间，但同一统计口径下 DeepEP normal 与 EPv2 hybrid
+  的 EP kernel 总量非常接近。
+- EPv2 hybrid 的小额额外开销主要体现在 dispatcher/adapter 包装层、combine/copy 以及
+  runner 衔接路径上，而不是 native ElasticBuffer kernel 明显慢。
+- 当前 EPv2 只有单段 `dispatch/combine`，没有 legacy DeepEP 的
+  `dispatch_a/dispatch_b/combine_a/combine_b` overlap hook 结构；这是后续优化和对齐项。
+
+### Decode-like profiling：DeepEP low_latency vs EPv2 direct
+
+测试条件：`ISL=1, OSL=1024, CC=128, capacity=1024`。
+DeepEP low_latency 复测必须设置 `NVSHMEM_DISABLE_CUDA_VMM=0`。
+
+这轮 profiling 发现旧 wrapper 还强制设置了 `SGLANG_OPT_SWIGLU_CLAMP_FUSION=false`。
+该设置会让 DeepEP LL + DeepGEMM masked path 在 padded layout 上单独执行 swiglu clamp，
+从而严重拖慢 DeepEP baseline。corrected baseline 应使用 `SGLANG_OPT_SWIGLU_CLAMP_FUSION=true`。
+
+非 profiler 性能：
+
+| Backend | Mode | Extra env | Output tok/s | Mean TPOT | 结论 |
+| --- | --- | --- | ---: | ---: | --- |
+| DeepEP | low_latency | `SGLANG_OPT_SWIGLU_CLAMP_FUSION=false` | 441.49 | 283.87 ms | 旧 wrapper，非公平 baseline |
+| DeepEP | low_latency | `SGLANG_OPT_SWIGLU_CLAMP_FUSION=true` | 953.93 | 129.27 ms | corrected baseline，当前最快 |
+| EPv2 | direct | capacity=1024 | 730.17 | 170.77 ms | 慢于 corrected DeepEP LL，当前默认路径 |
+| EPv2 | direct | BF16 masked experiment | 774.37 | 160.88 ms | 实验方案 2，略快于默认但需本地重新量化 |
+| EPv2 | direct | fused contiguous + empty guard | 760.72 | 163.76 ms | 实验方案 1，需修 empty-token rank 后才可用 |
+
+profile 结论：
+
+- DeepEP LL fusion=false 的主要异常是 `_apply_swiglu_limit` 对 `[262144, 2048]` padded tensor 做单独 `torch.clamp`，全 rank median 约 `1023.68 ms/rank`。
+- DeepEP LL fusion=true 后，大 clamp 消失，swiglu clamp median 降到约 `0.02 ms/rank`，activation/quant 约 `14.70 ms/rank`。
+- EPv2 direct 走 contiguous adapter，swiglu clamp shape 是 actual-token 规模，通常 `[1536~2944, 2048]`，median 约 `8.70 ms/rank`；但 DeepGEMM/adapter 路径整体仍慢于 corrected DeepEP LL。
+- DeepEP LL 和 EPv2 direct 的 EP dispatch kernel 在 torch profiler 中都是 long-running/waiting 型通信 kernel，不能把 trace duration 直接等价为单步计算耗时。
+- 因此 decode/direct 场景里，EPv2 相比旧 DeepEP wrapper 有收益，但相比 corrected DeepEP LL baseline 仍需要优化。
+- 实验方案 2 说明 masked DeepGEMM 路径本身可作为参考，但 EPv2 BF16 dispatch 后重新 preprocess/quant 会重复搬运和量化 activation，设计上不如直接消费 FP8 dispatch output 干净。
+- 实验方案 1 说明 fused contiguous activation 的首要 blocker 是 empty-token rank；需要在正式 adapter 中对 `all_tokens == 0` 做一致语义处理，再继续看 fused kernel 是否能带来稳定收益。
+
+### 当前性能判断
+
+- EPv2 direct decode 相比旧 DeepEP LL wrapper 有收益，但相比 corrected DeepEP LL baseline 仍落后。
+- EPv2 hybrid prefill 已经稳定可跑，但还略慢于 DeepEP normal；优化重点应放在
+  SGLang adapter/handle 生命周期/overlap hook/runner 衔接，而不是先假设 native
+  EPv2 kernel 本身慢。
+
+## 已知限制
+
+- EPv2 当前只支持 DeepGEMM FP8 与 Triton BF16 两条 runner adapter。
+- TBO/SBO overlap hooks 尚未实现，server 启动阶段会直接拒绝。
+- CUDA graph 当前对 EPv2 关闭，后续需要验证 graph capture 安全性。
+- Shared expert fusion 当前对 EPv2 关闭，后续需要单独验证 fused path。
+- Decode 场景存在 empty-token rank。当前默认 fallback path 可运行，但 fused contiguous activation 实验暴露 `all_tokens == 0` 时 JIT kernel launch 失败，后续需要对齐 DeepEP LL 的 empty-rank 语义。
+- E2E capacity 边界测试还不够确定。SGLang scheduler、tokenization、chunked-prefill
+  可能在请求进入 EPv2 dispatcher 前就先拦截或切分请求；当前只能用 synthetic
+  dispatcher test 覆盖 capacity guard，后续需要 server 内 instrumentation。
+- 当前 `EpV2Buffer` 是 singleton + 详细 key。单模型单配置可用，但多模型、多 group、
+  混合 dtype/capacity 切换时应改成显式 per-key buffer 生命周期管理。
+- `_to_local_topk_ids()` 当前依赖 global/local expert id range 约定。后续应对齐
+  DeepEP v2 API contract，并增加更严格 assert。
+- EPv2 direct/hybrid mode 在 server 生命周期内固定；当前没有 DeepEP v1 风格的
+  normal/low_latency 自动切换。
+
+## 后续优化项
+
+- 基于已完成 timeline 继续细化 EPv2 hybrid prefill 的 dispatcher/adapter 包装层开销。
+- 检查 `ElasticBuffer`、workspace 和 handle 生命周期开销。
+- 实验 `do_cpu_sync=False` 是否正确且有性能收益；只有确认不会破坏 recv token 计数后再考虑启用。
+- 从 singleton buffer 演进到显式 per-key buffer 生命周期管理。
+- 扩展 runner capability contract，再考虑支持 FlashInfer、Cutlass 或其他 MoE runner。
+- 增加确定性的 E2E capacity instrumentation，记录每次进入 EPv2 dispatch 的实际 token 数，避免只能依赖 synthetic test。
