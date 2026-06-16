@@ -8,7 +8,6 @@ import torch
 import torch.distributed as dist
 
 from sglang.srt.environ import envs
-from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.moe.token_dispatcher.base import (
     BaseDispatcher,
     CombineInput,
@@ -19,6 +18,7 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
 from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.moe.utils import (
     EpV2OutputDtype,
+    EpV2RunnerCapability,
     get_epv2_runner_capability,
 )
 
@@ -119,14 +119,16 @@ def _get_allow_hybrid_mode() -> bool:
     return epv2_mode == "hybrid"
 
 
-def _quantize_for_epv2_dispatch(hidden_states: torch.Tensor):
+def _quantize_for_epv2_dispatch(
+    hidden_states: torch.Tensor, capability: EpV2RunnerCapability
+):
     _ensure_fp8_quant_available()
     return sglang_per_token_group_quant_fp8(
         hidden_states,
         _SCALE_BLOCK_SIZE,
-        column_major_scales=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-        scale_tma_aligned=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-        scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+        column_major_scales=capability.fp8_scale_ue8m0,
+        scale_tma_aligned=capability.fp8_scale_ue8m0,
+        scale_ue8m0=capability.fp8_scale_ue8m0,
     )
 
 
@@ -198,8 +200,7 @@ class _EpV2Impl:
         num_experts: int,
         num_local_experts: int,
         hidden_size: int,
-        output_dtype: EpV2OutputDtype,
-        expert_alignment: int,
+        capability: EpV2RunnerCapability,
         num_max_dispatch_tokens_per_rank: int,
     ):
         self.group = group
@@ -207,26 +208,19 @@ class _EpV2Impl:
         self.num_experts = num_experts
         self.num_local_experts = num_local_experts
         self.hidden_size = hidden_size
-        self.output_dtype = output_dtype
-        self.expert_alignment = expert_alignment
+        self.capability = capability
         self.num_max_dispatch_tokens_per_rank = num_max_dispatch_tokens_per_rank
         self.rank = dist.get_rank(group)
         self._handle = None
         self._num_input_tokens = 0
 
-    def set_runner_capability(
-        self, output_dtype: EpV2OutputDtype, expert_alignment: int
-    ) -> None:
-        if (
-            self.output_dtype != output_dtype
-            or self.expert_alignment != expert_alignment
-        ):
+    def set_runner_capability(self, capability: EpV2RunnerCapability) -> None:
+        if self.capability != capability:
             self._destroy_handle()
-            self.output_dtype = output_dtype
-            self.expert_alignment = expert_alignment
+            self.capability = capability
 
     def _uses_fp8_dispatch_output(self) -> bool:
-        return self.output_dtype == EpV2OutputDtype.FP8
+        return self.capability.output_dtype == EpV2OutputDtype.FP8
 
     def _destroy_handle(self) -> None:
         self._handle = None
@@ -293,8 +287,8 @@ class _EpV2Impl:
         self._num_input_tokens = hidden_states.shape[0]
 
         if self._uses_fp8_dispatch_output():
-            dispatch_x = _quantize_for_epv2_dispatch(hidden_states)
-            use_tma_aligned_col_major_sf = deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+            dispatch_x = _quantize_for_epv2_dispatch(hidden_states, self.capability)
+            use_tma_aligned_col_major_sf = self.capability.fp8_scale_ue8m0
         else:
             dispatch_x = hidden_states
             use_tma_aligned_col_major_sf = False
@@ -307,7 +301,7 @@ class _EpV2Impl:
             topk_weights=topk_weights,
             num_experts=self.num_experts,
             num_max_tokens_per_rank=self.num_max_dispatch_tokens_per_rank,
-            expert_alignment=self.expert_alignment,
+            expert_alignment=self.capability.expert_alignment,
             use_tma_aligned_col_major_sf=use_tma_aligned_col_major_sf,
             # None keeps ElasticBuffer's documented default: CPU sync is used
             # for a fresh handle so exact receive counts are available.
@@ -394,8 +388,7 @@ class EpV2Dispatcher(BaseDispatcher):
             num_experts=num_experts,
             num_local_experts=num_local_experts,
             hidden_size=hidden_size,
-            output_dtype=self.output_dtype,
-            expert_alignment=capability.expert_alignment,
+            capability=capability,
             num_max_dispatch_tokens_per_rank=self.num_max_dispatch_tokens_per_rank,
         )
         self._stage = _Stage.INITIAL
@@ -404,9 +397,7 @@ class EpV2Dispatcher(BaseDispatcher):
         self.quant_config = quant_config
         capability = get_epv2_runner_capability(self)
         self.output_dtype = capability.output_dtype
-        self._impl.set_runner_capability(
-            capability.output_dtype, capability.expert_alignment
-        )
+        self._impl.set_runner_capability(capability)
 
     def dispatch(
         self, hidden_states: torch.Tensor, topk_output: TopKOutput

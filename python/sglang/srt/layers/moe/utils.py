@@ -171,6 +171,7 @@ class EpV2RunnerCapability(NamedTuple):
 
     output_dtype: EpV2OutputDtype
     expert_alignment: int
+    fp8_scale_ue8m0: bool = False
 
 
 class DeepEPMode(Enum):
@@ -310,10 +311,28 @@ def get_epv2_output_dtype(self) -> EpV2OutputDtype:
 
 def get_epv2_runner_capability(self) -> EpV2RunnerCapability:
     output_dtype = get_epv2_output_dtype(self)
+    runner_backend = get_moe_runner_backend()
     if output_dtype == EpV2OutputDtype.FP8:
+        if not runner_backend.is_deep_gemm():
+            raise ValueError(
+                "DeepEP v2 FP8 dispatch output currently requires "
+                "--moe-runner-backend deep_gemm because the adapter must consume "
+                f"activation scales. Got {runner_backend.value}."
+            )
+        from sglang.srt.layers import deep_gemm_wrapper
+
         # The currently supported FP8 adapter is DeepGEMM, whose expert-major
-        # input path requires 128-token expert alignment.
-        return EpV2RunnerCapability(output_dtype=output_dtype, expert_alignment=128)
+        # input path requires 128-token expert alignment and DeepGEMM scale layout.
+        return EpV2RunnerCapability(
+            output_dtype=output_dtype,
+            expert_alignment=128,
+            fp8_scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+        )
+    if not runner_backend.is_triton():
+        raise ValueError(
+            "DeepEP v2 BF16 dispatch output currently requires "
+            f"--moe-runner-backend triton. Got {runner_backend.value}."
+        )
     return EpV2RunnerCapability(output_dtype=output_dtype, expert_alignment=1)
 
 
