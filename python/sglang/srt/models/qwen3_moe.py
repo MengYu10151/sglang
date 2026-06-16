@@ -281,7 +281,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             prefix=add_prefix("gate", prefix),
         )
 
-        if get_moe_a2a_backend().is_deepep():
+        if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_ncclep():
             # TODO: we will support tp < ep in the future
             self.ep_size = get_moe_expert_parallel_world_size()
             self.num_experts = (
@@ -306,7 +306,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
                 hidden_states, should_allreduce_fusion, use_reduce_scatter
             )
         else:
-            return self.forward_deepep(hidden_states, forward_batch)
+            return self.forward_a2a_moe(hidden_states, forward_batch)
 
     def get_moe_weights(self):
         return [
@@ -350,7 +350,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
 
         return final_hidden_states.view(num_tokens, hidden_dim)
 
-    def forward_deepep(
+    def forward_a2a_moe(
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
     ) -> torch.Tensor:
         if hidden_states.shape[0] > 0:

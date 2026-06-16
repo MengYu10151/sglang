@@ -338,7 +338,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         else:
             self.shared_expert_gate = torch.nn.Linear(config.hidden_size, 1, bias=False)
 
-        if get_moe_a2a_backend().is_deepep():
+        if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_ncclep():
             # TODO: we will support tp < ep in the future
             self.ep_size = get_moe_expert_parallel_world_size()
             self.num_experts = (
@@ -431,7 +431,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
 
         return shared_output
 
-    def _forward_deepep(self, hidden_states: torch.Tensor, forward_batch: ForwardBatch):
+    def _forward_a2a_moe(self, hidden_states: torch.Tensor, forward_batch: ForwardBatch):
         enable_dual_stream = (
             is_npu()
             and envs.SGLANG_NPU_USE_MULTI_STREAM.get()
@@ -536,7 +536,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         hidden_states = hidden_states.view(-1, hidden_dim)
 
         if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_ncclep():
-            return self._forward_deepep(hidden_states, forward_batch)
+            return self._forward_a2a_moe(hidden_states, forward_batch)
 
         use_fused_gate = (
             self.shared_expert_gate is not None

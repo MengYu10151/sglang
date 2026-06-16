@@ -36,7 +36,7 @@ NCCL_EP 只替换 MoE expert-parallel 的 dispatch/combine 通信，不替换 at
 
 - DSv4 Flash FP8 的主线是 `DeepGEMM + FP8 activation + activation scale`。
 - Triton runner 需要 BF16 activation，不消费 FP8 activation scale。
-- Qwen2-MoE / Qwen3.5 路径需要显式让 `is_ncclep()` 进入 EP MoE forward 语义；不能简单落回普通 TP MoE 路径，否则 empty rank 和 post-expert all-reduce 调用顺序可能不一致。
+- Qwen2-MoE / Qwen3.5 路径需要显式让 `is_ncclep()` 进入 A2A MoE forward 语义；模型层共享 `forward_a2a_moe` 的 router/topk/shared-expert 流程，通信 backend 仍在 dispatcher 层独立选择 `NcclEpDispatcher`，不能落回普通 TP MoE 路径。
 - no-NVL 拓扑下，LL 可以通过 `NCCL_LSA_TEAM_SIZE=1` 规避部分 HT/LSA/NVL 假设，但性能和稳定性仍需单独验证。
 - PD disaggregation 的语义应保持：P 节点用 HT，D 节点用 LL。PD 会混入 NIXL/router/KV transfer，不适合作为 NCCL_EP dispatcher 的第一验证入口。
 
@@ -298,6 +298,7 @@ bash scripts/run_ncclep_boundary_cases.sh
 - 固定 deterministic prompt。
 - 使用 chat template / OpenAI chat endpoint，避免 raw generate 造成模型续写异常。
 - HT/LL 分开测，不混用 prefill/decode 语义。
+- Qwen3.5-35B-A3B-FP8 / 5k11 no-NVL / Triton BF16 / NCCL_EP LL 在 no-EPLB 分支上完成回归：`dp-size=4, ep-size=4, enable-dp-attention, ncclep-mode=low_latency, ncclep-dispatcher-output-dtype=bf16`，capital/math `/generate` correctness 通过。
 
 6. Serving benchmark：
 
