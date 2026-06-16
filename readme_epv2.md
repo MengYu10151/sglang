@@ -207,6 +207,7 @@ DP-attention 设置，均关闭 CUDA graph 与 TBO/SBO，`max_prefill_tokens=819
 | EPv2 | direct | 1024 | 128 | 730.17 | 170.77 ms | 1319.88 ms | PASS，当前默认路径 |
 | EPv2 | direct | 1024 | 128 | 774.37 | 160.88 ms | 1255.55 ms | PASS，实验方案 2：BF16 dispatch + masked DeepGEMM preprocess，本地重新量化 |
 | EPv2 | direct | 1024 | 128 | 760.72 | 163.76 ms | 1278.87 ms | PASS，实验方案 1：FP8 dispatch + fused contiguous activation + empty-token guard |
+| EPv2 | direct | 1024 | 128 | 804.54 | 154.68 ms | 1234.64 ms | PASS，正式优化：复用 EPv2 epilogue local topk 输出，移除冗余 `max().item()` CPU sync |
 
 结论：capacity 对正确性和性能都有明显影响。CC=128 时 runtime 可能发出比单步
 decode 更大的 MoE dispatch batch，因此 capacity=128 不足。capacity 对齐为 1024 后，
@@ -215,6 +216,8 @@ decode 更大的 MoE dispatch batch，因此 capacity=128 不足。capacity 对�
 当前快于 EPv2 direct。后续 decode 对比必须同时标注 capacity、VMM 和 swiglu clamp fusion。
 
 补充实验结论：方案 2 通过 BF16 dispatch 后重新进入 masked DeepGEMM preprocess，性能略高于当前默认 EPv2 direct，但引入本地二次量化和额外 adapter 语义，不适合作为优先产品化方向。方案 1 保持 FP8 dispatch，方向更干净，但当前需要补 empty-token rank guard 才能避免 `silu_and_mul_contig_post_quant` 对 `num_tokens=0` launch 时报 `CUDA error: invalid argument`，且性能仍低于 corrected DeepEP LL。
+
+2026-06-17 更新：参考 DeepEP v2 `dispatch_copy_epilogue_impl` 源码确认，EPv2 dispatch epilogue 已经把 global expert id 转成 local expert id，并把非本 rank 选择写为 `-1`。因此 SGLang 侧删除了 `_to_local_topk_ids()` 的 `max().item()` 分支，避免 decode 热路径上的 GPU->CPU sync。该优化后 EPv2 direct decode 提升到 `804.54 output tok/s / 154.68 ms TPOT`，但仍慢于 corrected DeepEP LL 的 `953.93 output tok/s / 129.27 ms TPOT`。
 
 详细过程和日志保存在源码树外：
 
@@ -232,6 +235,9 @@ decode 更大的 MoE dispatch batch，因此 capacity=128 不足。capacity 对�
 /root/menyu/logs/deepep_epv2_torch_profile_warm_20260616_175003/
 /root/menyu/logs/deepep_epv2_torch_profile_warm_decode_epv2_180505/
 /root/menyu/logs/deepep_epv2_torch_profile_warm_decode_deepep_vmm0_214145/
+/root/menyu/logs/deepep_epv2_torch_profile_warm_decode_deepep_fusion_true_vmm0_20260616_222235/
+/root/menyu/logs/deepep_epv2_torch_profile_fixmega_decode_epv2_20260617_003023/
+/root/menyu/logs/deepep_epv2_torch_profile_topkfix_decode_epv2_20260617_010354/
 /root/menyu/logs/deepep_epv2_menyu_bench_*
 ```
 
@@ -270,12 +276,15 @@ DeepEP low_latency 复测必须设置 `NVSHMEM_DISABLE_CUDA_VMM=0`。
 | EPv2 | direct | capacity=1024 | 730.17 | 170.77 ms | 慢于 corrected DeepEP LL，当前默认路径 |
 | EPv2 | direct | BF16 masked experiment | 774.37 | 160.88 ms | 实验方案 2，略快于默认但需本地重新量化 |
 | EPv2 | direct | fused contiguous + empty guard | 760.72 | 163.76 ms | 实验方案 1，需修 empty-token rank 后才可用 |
+| EPv2 | direct | topk sync fix + fused contiguous | 804.54 | 154.68 ms | 正式优化，删除冗余 `_to_local_topk_ids()` CPU sync |
 
 profile 结论：
 
 - DeepEP LL fusion=false 的主要异常是 `_apply_swiglu_limit` 对 `[262144, 2048]` padded tensor 做单独 `torch.clamp`，全 rank median 约 `1023.68 ms/rank`。
 - DeepEP LL fusion=true 后，大 clamp 消失，swiglu clamp median 降到约 `0.02 ms/rank`，activation/quant 约 `14.70 ms/rank`。
 - EPv2 direct 走 contiguous adapter，swiglu clamp shape 是 actual-token 规模，通常 `[1536~2944, 2048]`，median 约 `8.70 ms/rank`；但 DeepGEMM/adapter 路径整体仍慢于 corrected DeepEP LL。
+- topk sync fix 后，`_to_local_topk_ids()` 从 trace 消失，`step[DECODE]` median 从 `284.45 ms` 降到 `269.79 ms`，非 profiler 吞吐提升到 `804.54 tok/s`。
+- topk sync fix 后剩余 gap 主要在 adapter：`pre_permute_epv2_to_deep_gemm` 约 `0.4361 ms/layer`，`post_permute_deep_gemm_to_epv2` 约 `0.1279 ms/layer`，而 DeepEP LL 对应路径基本是 pass-through。
 - DeepEP LL 和 EPv2 direct 的 EP dispatch kernel 在 torch profiler 中都是 long-running/waiting 型通信 kernel，不能把 trace duration 直接等价为单步计算耗时。
 - 因此 decode/direct 场景里，EPv2 相比旧 DeepEP wrapper 有收益，但相比 corrected DeepEP LL baseline 仍需要优化。
 - 实验方案 2 说明 masked DeepGEMM 路径本身可作为参考，但 EPv2 BF16 dispatch 后重新 preprocess/quant 会重复搬运和量化 activation，设计上不如直接消费 FP8 dispatch output 干净。
@@ -294,14 +303,13 @@ profile 结论：
 - TBO/SBO overlap hooks 尚未实现，server 启动阶段会直接拒绝。
 - CUDA graph 当前对 EPv2 关闭，后续需要验证 graph capture 安全性。
 - Shared expert fusion 当前对 EPv2 关闭，后续需要单独验证 fused path。
-- Decode 场景存在 empty-token rank。当前默认 fallback path 可运行，但 fused contiguous activation 实验暴露 `all_tokens == 0` 时 JIT kernel launch 失败，后续需要对齐 DeepEP LL 的 empty-rank 语义。
+- Decode 场景存在 empty-token rank。fused contiguous activation 路径已补 `all_tokens == 0` guard，避免空 token rank 进入 `silu_and_mul_contig_post_quant` 的 zero-size kernel launch；后续还需要更完整的 corner-case 矩阵覆盖。
 - E2E capacity 边界测试还不够确定。SGLang scheduler、tokenization、chunked-prefill
   可能在请求进入 EPv2 dispatcher 前就先拦截或切分请求；当前只能用 synthetic
   dispatcher test 覆盖 capacity guard，后续需要 server 内 instrumentation。
 - 当前 `EpV2Buffer` 是 singleton + 详细 key。单模型单配置可用，但多模型、多 group、
   混合 dtype/capacity 切换时应改成显式 per-key buffer 生命周期管理。
-- `_to_local_topk_ids()` 当前依赖 global/local expert id range 约定。后续应对齐
-  DeepEP v2 API contract，并增加更严格 assert。
+- EPv2 `recv_topk_idx` local expert id 语义已按 DeepEP v2 native epilogue 源码对齐，后续应增加 unit/synthetic test 固化该 API contract，避免未来 DeepEP v2 变更时静默破坏。
 - EPv2 direct/hybrid mode 在 server 生命周期内固定；当前没有 DeepEP v1 风格的
   normal/low_latency 自动切换。
 

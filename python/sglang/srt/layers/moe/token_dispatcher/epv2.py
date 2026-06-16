@@ -259,26 +259,6 @@ class _EpV2Impl:
                 f"got {topk_ids.shape[1]}"
             )
 
-    @staticmethod
-    def _to_local_topk_ids(
-        topk_ids: torch.Tensor,
-        rank: int,
-        num_local_experts: int,
-    ) -> torch.Tensor:
-        valid_topk = topk_ids[topk_ids >= 0]
-        if valid_topk.numel() == 0:
-            return topk_ids
-        if int(valid_topk.max().item()) < num_local_experts:
-            local_topk_ids = topk_ids
-        else:
-            local_expert_start = rank * num_local_experts
-            local_topk_ids = topk_ids - local_expert_start
-
-        local_mask = (local_topk_ids >= 0) & (local_topk_ids < num_local_experts)
-        return torch.where(
-            local_mask, local_topk_ids, torch.full_like(local_topk_ids, -1)
-        )
-
     def dispatch(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
         _ensure_epv2_available()
         topk_weights = topk_output.topk_weights
@@ -324,9 +304,10 @@ class _EpV2Impl:
         if recv_hidden_states_scale is not None:
             recv_hidden_states_scale = recv_hidden_states_scale[:num_recv_tokens]
 
-        local_topk_ids = self._to_local_topk_ids(
-            recv_topk_idx, self.rank, self.num_local_experts
-        )
+        # Elastic dispatch epilogue already converts global expert ids to local
+        # expert ids and marks non-local choices as -1. Keep it on-GPU and avoid
+        # an unnecessary max().item() synchronization in the decode path.
+        local_topk_ids = recv_topk_idx
         num_recv_tokens_per_expert = list(handle.num_recv_tokens_per_expert_list)
 
         return EpV2DispatchOutput(
