@@ -170,35 +170,46 @@ class Mxfp4MarlinMoEMethod:
         layer: Module,
         dispatch_output: DispatchOutput,
     ) -> CombineInput:
+        from sglang.srt.layers.moe.token_dispatcher.base import DispatchOutputChecker
+        from sglang.srt.layers.moe.token_dispatcher.ncclep import (
+            NcclEpHighThroughputCombineInput,
+            NcclEpHighThroughputExpertMajorDispatchOutput,
+            NcclEpLowLatencyCombineInput,
+        )
         from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
         from sglang.srt.layers.moe.topk import TopKOutputChecker
 
-        topk_output = dispatch_output.topk_output
-        if not TopKOutputChecker.format_is_standard(topk_output):
-            raise ValueError(f"Unsupported topk output format: {topk_output.format}")
+        def _marlin_quant_info() -> MarlinMoeQuantInfo:
+            return MarlinMoeQuantInfo(
+                w13_qweight=layer.w13_weight,
+                w2_qweight=layer.w2_weight,
+                w13_scales=layer.w13_weight_scale,
+                w2_scales=layer.w2_weight_scale,
+                w13_g_idx_sort_indices=None,
+                w2_g_idx_sort_indices=None,
+                weight_bits=4,
+                is_k_full=True,
+            )
 
-        # SM120: use Triton fused dequant+GEMM (Marlin kernel produces NaN on SM120)
-        if layer._dsv4_mxfp4_backend == "sm120_triton":
+        def _run_sm120_triton(hidden_states, topk_ids, topk_weights):
             from sglang.srt.layers.moe.fused_moe_triton.mxfp4_moe_sm120_triton import (
                 mxfp4_moe_forward_triton,
             )
 
-            hidden_states = dispatch_output.hidden_states
             w13 = layer.w13_weight.data
             w2 = layer.w2_weight.data
             w13_scale = layer.w13_weight_scale_inv.data
             w2_scale = layer.w2_weight_scale_inv.data
             intermediate_size = w13.shape[1] // 2
             hidden_size = w13.shape[2] * 2
-
-            output = mxfp4_moe_forward_triton(
+            return mxfp4_moe_forward_triton(
                 hidden_states=hidden_states,
                 w13_packed=w13,
                 w2_packed=w2,
                 w13_scale=w13_scale,
                 w2_scale=w2_scale,
-                topk_ids=topk_output.topk_ids,
-                topk_weights=topk_output.topk_weights,
+                topk_ids=topk_ids,
+                topk_weights=topk_weights,
                 hidden_size=hidden_size,
                 intermediate_size=intermediate_size,
                 routed_scaling_factor=(
@@ -212,18 +223,152 @@ class Mxfp4MarlinMoEMethod:
                     else None
                 ),
             )
+
+        if DispatchOutputChecker.format_is_ncclep_low_latency(dispatch_output):
+            hidden_states, hidden_states_scale, topk_ids, topk_weights, masked_m, _ = (
+                dispatch_output
+            )
+            if hidden_states_scale is not None or hidden_states.dtype not in (
+                torch.bfloat16,
+                torch.float16,
+            ):
+                raise RuntimeError(
+                    "NCCL_EP low_latency -> SM120 MXFP4 fallback expects "
+                    "BF16/FP16 dispatch output. Use "
+                    "--ncclep-dispatcher-output-dtype bf16."
+                )
+            if layer._dsv4_mxfp4_backend != "sm120_triton":
+                return self.runner.run(dispatch_output, quant_info=_marlin_quant_info())
+
+            num_local_experts, max_slots, _ = hidden_states.shape
+            slot_ids = torch.arange(max_slots, device=hidden_states.device)
+            valid_mask = slot_ids.unsqueeze(0) < masked_m.to(torch.long).unsqueeze(1)
+            compact_hidden = hidden_states[valid_mask].contiguous()
+            output = hidden_states
+            if compact_hidden.numel() != 0:
+                compact_topk_ids = (
+                    torch.arange(
+                        num_local_experts,
+                        device=hidden_states.device,
+                        dtype=torch.int32,
+                    )
+                    .unsqueeze(1)
+                    .expand(num_local_experts, max_slots)[valid_mask]
+                    .reshape(-1, 1)
+                    .contiguous()
+                )
+                compact_topk_weights = torch.ones(
+                    (compact_hidden.shape[0], 1),
+                    dtype=torch.float32,
+                    device=hidden_states.device,
+                )
+                output[valid_mask] = _run_sm120_triton(
+                    compact_hidden, compact_topk_ids, compact_topk_weights
+                )
+            return NcclEpLowLatencyCombineInput(
+                hidden_states=output,
+                topk_ids=topk_ids,
+                topk_weights=topk_weights,
+            )
+
+        if DispatchOutputChecker.format_is_ncclep_high_throughput(dispatch_output):
+            if isinstance(dispatch_output, NcclEpHighThroughputExpertMajorDispatchOutput):
+                (
+                    hidden_states,
+                    hidden_states_scale,
+                    topk_weights,
+                    num_recv_tokens_per_expert,
+                    _,
+                    _,
+                ) = dispatch_output
+                if hidden_states_scale is not None or hidden_states.dtype not in (
+                    torch.bfloat16,
+                    torch.float16,
+                ):
+                    raise RuntimeError(
+                        "NCCL_EP high_throughput expert-major -> SM120 MXFP4 "
+                        "fallback expects BF16/FP16 dispatch output. Use "
+                        "--ncclep-dispatcher-output-dtype bf16."
+                    )
+                if layer._dsv4_mxfp4_backend != "sm120_triton":
+                    return self.runner.run(
+                        dispatch_output, quant_info=_marlin_quant_info()
+                    )
+
+                all_tokens = sum(num_recv_tokens_per_expert)
+                output = torch.zeros_like(hidden_states)
+                if all_tokens > 0:
+                    expert_ids = [
+                        torch.full(
+                            (count,),
+                            expert_id,
+                            dtype=torch.int32,
+                            device=hidden_states.device,
+                        )
+                        for expert_id, count in enumerate(num_recv_tokens_per_expert)
+                        if count > 0
+                    ]
+                    compact_topk_ids = torch.cat(expert_ids).reshape(-1, 1).contiguous()
+                    compact_topk_weights = topk_weights[:all_tokens]
+                    if compact_topk_weights.dim() == 1:
+                        compact_topk_weights = compact_topk_weights.reshape(-1, 1)
+                    else:
+                        compact_topk_weights = compact_topk_weights[:, :1]
+                    output[:all_tokens] = _run_sm120_triton(
+                        hidden_states[:all_tokens].contiguous(),
+                        compact_topk_ids,
+                        compact_topk_weights.to(torch.float32).contiguous(),
+                    )
+                return NcclEpHighThroughputCombineInput(hidden_states=output)
+
+            hidden_states, hidden_states_scale, topk_ids, topk_weights, _ = (
+                dispatch_output
+            )
+            if hidden_states_scale is not None or hidden_states.dtype not in (
+                torch.bfloat16,
+                torch.float16,
+            ):
+                raise RuntimeError(
+                    "NCCL_EP high_throughput -> SM120 MXFP4 fallback expects "
+                    "BF16/FP16 dispatch output. Use "
+                    "--ncclep-dispatcher-output-dtype bf16."
+                )
+            if layer._dsv4_mxfp4_backend != "sm120_triton":
+                return self.runner.run(dispatch_output, quant_info=_marlin_quant_info())
+
+            valid_rows = (topk_ids >= 0).any(dim=1)
+            output = torch.zeros_like(hidden_states)
+            if valid_rows.any():
+                compact_hidden = hidden_states[valid_rows].contiguous()
+                compact_topk_ids = topk_ids[valid_rows].contiguous()
+                compact_topk_weights = topk_weights[valid_rows].contiguous()
+                valid_topk = compact_topk_ids >= 0
+                compact_topk_weights = torch.where(
+                    valid_topk,
+                    compact_topk_weights,
+                    torch.zeros_like(compact_topk_weights),
+                )
+                compact_topk_ids = torch.where(
+                    valid_topk,
+                    compact_topk_ids,
+                    torch.zeros_like(compact_topk_ids),
+                )
+                output[valid_rows] = _run_sm120_triton(
+                    compact_hidden, compact_topk_ids, compact_topk_weights
+                )
+            return NcclEpHighThroughputCombineInput(hidden_states=output)
+
+        topk_output = dispatch_output.topk_output
+        if not TopKOutputChecker.format_is_standard(topk_output):
+            raise ValueError(f"Unsupported topk output format: {topk_output.format}")
+
+        # SM120: use Triton fused dequant+GEMM (Marlin kernel produces NaN on SM120)
+        if layer._dsv4_mxfp4_backend == "sm120_triton":
+            output = _run_sm120_triton(
+                dispatch_output.hidden_states,
+                topk_output.topk_ids,
+                topk_output.topk_weights,
+            )
             return StandardCombineInput(hidden_states=output)
 
-        quant_info = MarlinMoeQuantInfo(
-            w13_qweight=layer.w13_weight,
-            w2_qweight=layer.w2_weight,
-            w13_scales=layer.w13_weight_scale,
-            w2_scales=layer.w2_weight_scale,
-            w13_g_idx_sort_indices=None,
-            w2_g_idx_sort_indices=None,
-            weight_bits=4,
-            is_k_full=True,
-        )
-        runner_output = self.runner.run(dispatch_output, quant_info=quant_info)
-
-        return StandardCombineInput(hidden_states=runner_output.hidden_states)
+        return self.runner.run(dispatch_output, quant_info=_marlin_quant_info())

@@ -250,6 +250,11 @@ def _stream() -> int:
     return torch.cuda.current_stream().cuda_stream
 
 
+def _maybe_synchronize() -> None:
+    if os.getenv("SGLANG_NCCL_EP_SKIP_SYNC") != "1":
+        torch.cuda.synchronize()
+
+
 def _quantize_for_ncclep_dispatch(hidden_states: torch.Tensor):
     return sglang_per_token_group_quant_fp8(
         hidden_states,
@@ -797,7 +802,7 @@ class _NcclEpHighThroughputImpl(_NcclEpImplBase):
             stream=_stream(),
         )
         self._handle.complete(stream=_stream())
-        torch.cuda.synchronize()
+        _maybe_synchronize()
 
         if self._is_expert_major():
             counts = [int(x) for x in self._expert_counters.cpu().tolist()]
@@ -878,7 +883,7 @@ class _NcclEpHighThroughputImpl(_NcclEpImplBase):
             stream=_stream(),
         )
         self._handle.complete(stream=_stream())
-        torch.cuda.synchronize()
+        _maybe_synchronize()
         return combined
 
 
@@ -1134,7 +1139,7 @@ class _NcclEpLowLatencyImpl(_NcclEpImplBase):
                 self.rank,
                 trace_id,
             )
-        torch.cuda.synchronize()
+        _maybe_synchronize()
         if trace_ll:
             logger.info(
                 "NCCL_EP LL trace rank=%s call=%s phase=after_sync recv_count_sum=%s",
@@ -1207,7 +1212,7 @@ class _NcclEpLowLatencyImpl(_NcclEpImplBase):
                 self.rank,
                 trace_id,
             )
-        torch.cuda.synchronize()
+        _maybe_synchronize()
         if trace_ll:
             logger.info(
                 "NCCL_EP LL trace rank=%s call=%s phase=combine_after_sync",
