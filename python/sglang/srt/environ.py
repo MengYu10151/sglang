@@ -568,6 +568,9 @@ class Envs:
     # DeepEP
     SGLANG_DEEPEP_BF16_DISPATCH = EnvBool(False) # This argument is deprecated
     SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
+    # DeepEP legacy MNNVL/fabric memory handle support. Set false on
+    # environments where CU_MEM_HANDLE_TYPE_FABRIC is advertised but unusable.
+    SGLANG_DEEPEP_ALLOW_MNNVL = EnvBool(True)
     # DeepEP v2 per-rank communication buffer capacity. This is not a model
     # semantic token limit; large prefill/chunked-prefill workloads may need a
     # larger value.
