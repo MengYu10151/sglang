@@ -238,6 +238,8 @@ decode 更大的 MoE dispatch batch，因此 capacity=128 不足。capacity 对�
 /root/menyu/logs/deepep_epv2_torch_profile_warm_decode_deepep_fusion_true_vmm0_20260616_222235/
 /root/menyu/logs/deepep_epv2_torch_profile_fixmega_decode_epv2_20260617_003023/
 /root/menyu/logs/deepep_epv2_torch_profile_topkfix_decode_epv2_20260617_010354/
+/root/menyu/logs/deepep_epv2_corrected_bench_epv2_fixmega1_isl1_osl1024_cc128_20260617_024425/
+/root/menyu/logs/deepep_epv2_corrected_profile_epv2_fixmega1_decode_isl1_osl1024_cc128_20260617_025141/
 /root/menyu/logs/deepep_epv2_menyu_bench_*
 ```
 
@@ -273,7 +275,8 @@ DeepEP low_latency 复测必须设置 `NVSHMEM_DISABLE_CUDA_VMM=0`。
 | --- | --- | --- | ---: | ---: | --- |
 | DeepEP | low_latency | `SGLANG_OPT_SWIGLU_CLAMP_FUSION=false` | 441.49 | 283.87 ms | 旧 wrapper，非公平 baseline |
 | DeepEP | low_latency | `SGLANG_OPT_SWIGLU_CLAMP_FUSION=true` | 953.93 | 129.27 ms | corrected baseline，当前最快 |
-| EPv2 | direct | capacity=1024 | 730.17 | 170.77 ms | 慢于 corrected DeepEP LL，当前默认路径 |
+| EPv2 | direct | capacity=1024, `FIX_MEGA=0` | 730.17 | 170.77 ms | correctness PASS 的基础路径，慢于 corrected DeepEP LL |
+| EPv2 | direct | `FIX_MEGA=1` + no-swizzle guard | 808.29 | 154.02 ms | strict chat correctness PASS 后的 corrected fused contiguous path，仍慢于 corrected DeepEP LL |
 | EPv2 | direct | BF16 masked experiment | 774.37 | 160.88 ms | 仅作隔离对照；DeepGEMM 主路径不应使用 BF16 dispatch 后二次量化 |
 | EPv2 | direct | fused contiguous + empty guard, swizzle=True | 760.72 | 163.76 ms | INVALID，严格 correctness 失败 |
 | EPv2 | direct | topk sync fix + fused contiguous, swizzle=True | 804.54 | 154.68 ms | INVALID，严格 correctness 失败 |
@@ -284,15 +287,22 @@ profile 结论：
 - DeepEP LL fusion=true 后，大 clamp 消失，swiglu clamp median 降到约 `0.02 ms/rank`，activation/quant 约 `14.70 ms/rank`。
 - EPv2 direct 走 contiguous adapter，swiglu clamp shape 是 actual-token 规模，通常 `[1536~2944, 2048]`，median 约 `8.70 ms/rank`；但 DeepGEMM/adapter 路径整体仍慢于 corrected DeepEP LL。
 - topk sync fix 后，`_to_local_topk_ids()` 从 trace 消失；但对应 profile/bench 使用了后续证明 correctness 失败的 `SGLANG_OPT_FIX_MEGA_MOE_MEMORY=1` path，因此不能作为有效性能结论。
-- 当前有效 correctness 路径包括 EPv2 FP8 dispatch + DeepGEMM + `SGLANG_OPT_FIX_MEGA_MOE_MEMORY=0`，以及 `FIX_MEGA=1` + EPv2 no-swizzle guard。后者刚通过 strict chat correctness，性能/profile 仍需重测。
+- 当前有效 correctness 路径包括 EPv2 FP8 dispatch + DeepGEMM + `SGLANG_OPT_FIX_MEGA_MOE_MEMORY=0`，以及 `FIX_MEGA=1` + EPv2 no-swizzle guard。后者已完成 corrected bench/profile：非 profiler `808.29 output tok/s / 154.02 ms TPOT`，profiler 日志见 `deepep_epv2_corrected_profile_epv2_fixmega1_decode_isl1_osl1024_cc128_20260617_025141`。
 - DeepEP LL 和 EPv2 direct 的 EP dispatch kernel 在 torch profiler 中都是 long-running/waiting 型通信 kernel，不能把 trace duration 直接等价为单步计算耗时。
 - 因此 decode/direct 场景里，EPv2 相比旧 DeepEP wrapper 有收益，但相比 corrected DeepEP LL baseline 仍需要优化。
+
+- Corrected no-swizzle profile 的函数级统计显示，EPv2 direct 当前主要慢在 SGLang adapter/同步路径，而不是 attention：
+  - `epv2.py dispatch` median `0.462 ms/layer`，DeepEP LL `deepep.py dispatch` median `0.171 ms/layer`。
+  - `pre_permute_epv2_to_deep_gemm` median `0.444 ms/layer`，DeepEP LL pre-permute median `0.0049 ms/layer`。
+  - `post_permute_deep_gemm_to_epv2` median `0.128 ms/layer`，DeepEP LL post-permute median `0.0036 ms/layer`。
+  - `_run_contiguous_gemm` median `0.488 ms/layer`，DeepEP LL `_run_masked_gemm` median `0.345 ms/layer`。
+- `ElasticBuffer.dispatch(do_cpu_sync=None)` 在 fresh handle 下按 DeepEP v2 API 默认等价于 CPU sync。最小实验把它改成 `False` 后，首个 chat 请求阶段 segfault，日志 `/root/menyu/logs/epv2_correctness_docusync_false_20260617_030808`。因此不能简单关闭；需要先设计异步 recv-count / handle 生命周期，或者让 adapter 不依赖同步后的精确 CPU count。
 - 实验方案 2 只说明 masked DeepGEMM 路径本身可作为参考；但 EPv2 BF16 dispatch 后重新 preprocess/quant 会重复搬运和量化 activation。由于 EPv2 原生支持 FP8 dispatch + scales，DeepGEMM 主路径应直接消费 FP8 dispatch output。
 - 实验方案 1 的 fused contiguous activation 失败根因收敛到 swizzled activation reader：MegaMoE 的 swizzle=True 假设 gran=8 interleaved gate/up，EPv2 contiguous adapter 需要禁用该 reader。no-swizzle guard 已通过 strict chat correctness。
 
 ### 当前性能判断
 
-- EPv2 direct decode 相比旧 DeepEP LL wrapper 有收益，但相比 corrected DeepEP LL baseline 仍落后。
+- EPv2 direct decode 相比旧 DeepEP LL wrapper 有收益；corrected no-swizzle fused path 当前为 `808.29 tok/s / 154.02 ms TPOT`，相比 corrected DeepEP LL `953.93 tok/s / 129.27 ms TPOT` 仍落后约 15%。
 - EPv2 hybrid prefill 已经稳定可跑，但还略慢于 DeepEP normal；优化重点应放在
   SGLang adapter/handle 生命周期/overlap hook/runner 衔接，而不是先假设 native
   EPv2 kernel 本身慢。
@@ -324,7 +334,7 @@ profile 结论：
 
 - 基于已完成 timeline 继续细化 EPv2 hybrid prefill 的 dispatcher/adapter 包装层开销。
 - 检查 `ElasticBuffer`、workspace 和 handle 生命周期开销。
-- 实验 `do_cpu_sync=False` 是否正确且有性能收益；只有确认不会破坏 recv token 计数后再考虑启用。
+- `do_cpu_sync=False` 不能直接启用：最小实验已触发 segfault。后续需要设计异步 recv-count、cached handle 或固定容量 adapter 后再重试。
 - 从 singleton buffer 演进到显式 per-key buffer 生命周期管理。
 - 扩展 runner capability contract，再考虑支持 FlashInfer、Cutlass 或其他 MoE runner。
 - 增加确定性的 E2E capacity instrumentation，记录每次进入 EPv2 dispatch 的实际 token 数，避免只能依赖 synthetic test。
