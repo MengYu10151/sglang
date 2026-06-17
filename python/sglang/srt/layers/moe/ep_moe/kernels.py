@@ -917,6 +917,137 @@ def ep_scatter(
     )
     return
 
+@triton.jit
+def _fwd_kernel_ep_scatter_psum_init(
+    psum_num_recv_tokens_per_expert,
+    expert_start_loc,
+    m_indices,
+    BLOCK_E: tl.constexpr,
+):
+    cur_expert = tl.program_id(0)
+    cur_end = tl.load(psum_num_recv_tokens_per_expert + cur_expert)
+    cur_start = tl.load(
+        psum_num_recv_tokens_per_expert + cur_expert - 1,
+        mask=cur_expert > 0,
+        other=0,
+    )
+    cur_token_num = cur_end - cur_start
+    tl.store(expert_start_loc + cur_expert, cur_start)
+
+    off_expert = tl.arange(0, BLOCK_E)
+    for start_m in tl.range(0, cur_token_num, BLOCK_E, num_stages=4):
+        tl.store(m_indices + cur_start + start_m + off_expert, cur_expert)
+
+
+@torch.no_grad()
+def ep_scatter_from_psum(
+    recv_x: torch.Tensor,
+    recv_x_scale: torch.Tensor,
+    recv_topk: torch.Tensor,
+    psum_num_recv_tokens_per_expert: torch.Tensor,
+    expert_start_loc: torch.Tensor,
+    output_tensor: torch.Tensor,
+    output_tensor_scale: torch.Tensor,
+    m_indices: torch.Tensor,
+    output_index: torch.Tensor,
+    scale_ue8m0: bool = False,
+):
+    BLOCK_E = 128
+    BLOCK_D = 128
+    num_warps = 8
+    num_experts = psum_num_recv_tokens_per_expert.shape[0]
+    hidden_size = recv_x.shape[1]
+    scale_hidden_size = hidden_size // BLOCK_D
+    if scale_ue8m0:
+        scale_hidden_size = ceil_div(scale_hidden_size, 4)
+
+    assert m_indices.shape[0] % BLOCK_E == 0
+    is_fp8 = recv_x_scale is not None and recv_x.dtype != torch.bfloat16
+    if is_fp8:
+        assert recv_x_scale.dtype == output_tensor_scale.dtype
+        assert recv_x_scale.shape[1] == output_tensor_scale.shape[1] == scale_hidden_size
+
+    _fwd_kernel_ep_scatter_psum_init[(num_experts,)](
+        psum_num_recv_tokens_per_expert,
+        expert_start_loc,
+        m_indices,
+        num_warps=num_warps,
+        BLOCK_E=BLOCK_E,
+    )
+
+    grid = min(recv_topk.shape[0], 1024 * 8)
+    _fwd_kernel_ep_scatter_2[(grid,)](
+        recv_topk.shape[0],
+        expert_start_loc,
+        recv_x,
+        recv_x.stride(0),
+        recv_x.stride(1),
+        recv_x_scale,
+        recv_x_scale.stride(0) if is_fp8 else 0,
+        recv_x_scale.stride(1) if is_fp8 else 0,
+        recv_topk,
+        recv_topk.stride(0),
+        recv_topk.stride(1),
+        output_tensor,
+        output_tensor.stride(0),
+        output_tensor.stride(1),
+        output_tensor_scale,
+        output_tensor_scale.stride(0) if is_fp8 else 0,
+        output_tensor_scale.stride(1) if is_fp8 else 0,
+        output_index,
+        output_index.stride(0),
+        output_index.stride(1),
+        topk_num=recv_topk.shape[1],
+        num_warps=num_warps,
+        HIDDEN_SIZE=hidden_size,
+        HIDDEN_SIZE_PAD=triton.next_power_of_2(hidden_size),
+        SCALE_HIDDEN_SIZE=scale_hidden_size,
+        SCALE_HIDDEN_SIZE_PAD=triton.next_power_of_2(scale_hidden_size),
+        ATOMIC_ADD_SEM=None if not _is_musa else "relaxed",
+        IS_FP8=is_fp8,
+    )
+    return
+
+
+@triton.jit
+def _fwd_kernel_ep_expand_m_indices_init(
+    psum_num_recv_tokens_per_expert,
+    m_indices,
+    BLOCK_E: tl.constexpr,
+):
+    cur_expert = tl.program_id(0)
+    cur_end = tl.load(psum_num_recv_tokens_per_expert + cur_expert)
+    prev_end = tl.load(
+        psum_num_recv_tokens_per_expert + cur_expert - 1,
+        mask=cur_expert > 0,
+        other=0,
+    )
+    cur_start = ((prev_end + BLOCK_E - 1) // BLOCK_E) * BLOCK_E
+    aligned_end = ((cur_end + BLOCK_E - 1) // BLOCK_E) * BLOCK_E
+
+    off_expert = tl.arange(0, BLOCK_E)
+    for start_m in tl.range(0, aligned_end - cur_start, BLOCK_E, num_stages=4):
+        idx = cur_start + start_m + off_expert
+        tl.store(m_indices + idx, cur_expert, mask=idx < aligned_end)
+
+
+@torch.no_grad()
+def ep_expand_init_m_indices_from_psum(
+    psum_num_recv_tokens_per_expert: torch.Tensor,
+    m_indices: torch.Tensor,
+):
+    BLOCK_E = 128
+    num_warps = 8
+    num_experts = psum_num_recv_tokens_per_expert.shape[0]
+    assert m_indices.shape[0] % BLOCK_E == 0
+    _fwd_kernel_ep_expand_m_indices_init[(num_experts,)](
+        psum_num_recv_tokens_per_expert,
+        m_indices,
+        num_warps=num_warps,
+        BLOCK_E=BLOCK_E,
+    )
+    return
+
 
 @triton.jit
 def _fwd_kernel_ep_gather(

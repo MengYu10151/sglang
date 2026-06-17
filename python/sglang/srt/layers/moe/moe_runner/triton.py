@@ -300,7 +300,7 @@ def pre_permute_epv2_to_triton(
     runner_config: MoeRunnerConfig,
     running_state: dict,
 ) -> TritonRunnerInput:
-    hidden_states, hidden_states_scale, topk_ids, topk_weights, _ = dispatch_output
+    hidden_states, hidden_states_scale, topk_ids, topk_weights, *_ = dispatch_output
     if hidden_states_scale is not None or hidden_states.dtype != torch.bfloat16:
         raise RuntimeError(
             "DeepEP v2 -> Triton expects BF16 dispatch output without activation scales. "

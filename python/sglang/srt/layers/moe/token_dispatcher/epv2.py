@@ -49,9 +49,11 @@ if use_epv2:
 class EpV2DispatchOutput(NamedTuple):
     hidden_states: torch.Tensor
     hidden_states_scale: Optional[torch.Tensor]
-    topk_ids: torch.Tensor
+    topk_ids: Optional[torch.Tensor]
     topk_weights: torch.Tensor
     num_recv_tokens_per_expert: List[int]
+    psum_num_recv_tokens_per_expert: Optional[torch.Tensor] = None
+    is_expanded: bool = False
 
     @property
     def format(self) -> DispatchOutputFormat:
@@ -60,8 +62,8 @@ class EpV2DispatchOutput(NamedTuple):
 
 class EpV2CombineInput(NamedTuple):
     hidden_states: torch.Tensor
-    topk_ids: torch.Tensor
-    topk_weights: torch.Tensor
+    topk_ids: Optional[torch.Tensor]
+    topk_weights: Optional[torch.Tensor]
 
     @property
     def format(self) -> CombineInputFormat:
@@ -265,6 +267,7 @@ class _EpV2Impl:
         topk_ids = topk_output.topk_ids.to(torch.int64)
         self._validate_common(hidden_states, topk_ids)
         self._num_input_tokens = hidden_states.shape[0]
+        use_expand_layout = self.capability.use_expanded_layout
 
         if self._uses_fp8_dispatch_output():
             dispatch_x = _quantize_for_epv2_dispatch(hidden_states, self.capability)
@@ -286,6 +289,7 @@ class _EpV2Impl:
             # None keeps ElasticBuffer's documented default: CPU sync is used
             # for a fresh handle so exact receive counts are available.
             do_cpu_sync=None,
+            do_expand=use_expand_layout,
         )
         if event.event is not None:
             event.current_stream_wait()
@@ -298,16 +302,22 @@ class _EpV2Impl:
             recv_hidden_states_scale = None
 
         num_recv_tokens = int(handle.psum_num_recv_tokens_per_scaleup_rank[-1].item())
-        recv_topk_idx = recv_topk_idx[:num_recv_tokens]
-        recv_topk_weights = recv_topk_weights[:num_recv_tokens]
-        recv_hidden_states = recv_hidden_states[:num_recv_tokens]
-        if recv_hidden_states_scale is not None:
-            recv_hidden_states_scale = recv_hidden_states_scale[:num_recv_tokens]
+        if use_expand_layout:
+            # Expanded layout already has one row per local expert slot. There is
+            # no recv_topk_idx tensor in this native layout; combine uses handle
+            # metadata and expects top-k weights to be applied before combine.
+            local_topk_ids = None
+        else:
+            recv_topk_idx = recv_topk_idx[:num_recv_tokens]
+            recv_topk_weights = recv_topk_weights[:num_recv_tokens]
+            recv_hidden_states = recv_hidden_states[:num_recv_tokens]
+            if recv_hidden_states_scale is not None:
+                recv_hidden_states_scale = recv_hidden_states_scale[:num_recv_tokens]
 
-        # Elastic dispatch epilogue already converts global expert ids to local
-        # expert ids and marks non-local choices as -1. Keep it on-GPU and avoid
-        # an unnecessary max().item() synchronization in the decode path.
-        local_topk_ids = recv_topk_idx
+            # Elastic dispatch epilogue already converts global expert ids to local
+            # expert ids and marks non-local choices as -1. Keep it on-GPU and avoid
+            # an unnecessary max().item() synchronization in the decode path.
+            local_topk_ids = recv_topk_idx
         num_recv_tokens_per_expert = list(handle.num_recv_tokens_per_expert_list)
 
         return EpV2DispatchOutput(
@@ -316,6 +326,8 @@ class _EpV2Impl:
             local_topk_ids,
             recv_topk_weights,
             num_recv_tokens_per_expert,
+            handle.psum_num_recv_tokens_per_expert,
+            use_expand_layout,
         )
 
     def combine(self, combine_input: EpV2CombineInput) -> torch.Tensor:

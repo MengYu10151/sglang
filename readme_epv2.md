@@ -79,7 +79,7 @@ LL decode baseline 时需要显式设为 `0`。EPv2 direct 本身不依赖这个
 
 | MoE runner | EPv2 output dtype | 状态 | 说明 |
 | --- | --- | --- | --- |
-| `deep_gemm` | `fp8` | 支持 | Dispatcher 返回 FP8 activation 和 scale；adapter 使用 128-token expert alignment 与 DeepGEMM scale layout。 |
+| `deep_gemm` | `fp8` | 支持 | Dispatcher 返回 FP8 activation 和 scale；adapter 使用 EPv2 native expanded layout、128-token expert alignment 与 DeepGEMM scale layout。 |
 | `triton` | `bf16` | 支持 | Dispatcher 返回 BF16 activation，不返回 scale；adapter 在 Triton 前 compact valid rows，在 combine 前 expand 回 EPv2 layout。 |
 | `deep_gemm` | `bf16` | 拒绝 | 当前 DeepGEMM adapter 要求 FP8 activation + scale。 |
 | `triton` | `fp8` | 拒绝 | 当前 Triton adapter 要求 BF16 activation，且不消费 dispatcher scale。 |
@@ -98,6 +98,7 @@ LL decode baseline 时需要显式设为 `0`。EPv2 direct 本身不依赖这个
 - `python/sglang/srt/layers/moe/moe_runner/deep_gemm.py`
   - 新增 EPv2 -> DeepGEMM pre-permute 与 DeepGEMM -> EPv2 post-permute。
   - 直接消费 EPv2 FP8 activation 和 scale。
+  - DeepGEMM FP8 路径默认使用 EPv2 native expanded layout：dispatch copy epilogue 直接写 one-row-per-local-expert-slot 的 `recv_x`，从而跳过 SGLang 侧额外的 `ep_scatter/ep_gather` layout round-trip。
 - `python/sglang/srt/layers/moe/moe_runner/triton.py`
   - 新增 EPv2 -> Triton pre-permute 与 Triton -> EPv2 post-permute。
   - 处理 BF16 valid-row compaction/expansion。
@@ -204,7 +205,8 @@ DP-attention 设置，均关闭 CUDA graph 与 TBO/SBO，`max_prefill_tokens=819
 | EPv2 | direct | 1024 | 64 | 378.46 | 168.10 ms | 1163.30 ms | PASS |
 | DeepEP | low_latency | 1024 | 128 | 441.15 | 283.87 ms | 1810.45 ms | PASS，旧 wrapper：`SGLANG_OPT_SWIGLU_CLAMP_FUSION=false` |
 | DeepEP | low_latency | 1024 | 128 | 953.93 | 129.27 ms | 1796.47 ms | PASS，corrected baseline：`SGLANG_OPT_SWIGLU_CLAMP_FUSION=true` |
-| EPv2 | direct | 1024 | 128 | 730.17 | 170.77 ms | 1319.88 ms | PASS，当前默认路径 |
+| EPv2 | direct | 1024 | 128 | 808.29 | 154.02 ms | 1237.50 ms | PASS，corrected no-swizzle baseline，非 expanded layout |
+| EPv2 | direct | 1024 | 128 | 862.24 | 144.18 ms | 1193.45 ms | PASS，native expanded layout 默认路径；相对 corrected baseline output tok/s 提升约 6.7% |
 | EPv2 | direct | 1024 | 128 | 774.37 | 160.88 ms | 1255.55 ms | EXPERIMENT，BF16 dispatch + masked DeepGEMM preprocess，本地重新量化；仅作隔离对照，不是 DeepGEMM 主路径 |
 | EPv2 | direct | 1024 | 128 | 760.72 | 163.76 ms | 1278.87 ms | INVALID，旧实验方案 1：FP8 dispatch + fused contiguous activation + swizzle=True，correctness 失败 |
 | EPv2 | direct | 1024 | 128 | 804.54 | 154.68 ms | 1234.64 ms | INVALID，旧实验方案 1 + topk sync fix + swizzle=True，correctness 失败，不作为性能结论 |
@@ -218,6 +220,8 @@ decode 更大的 MoE dispatch batch，因此 capacity=128 不足。capacity 对�
 补充实验结论：EPv2 原生支持 FP8 dispatch，DeepGEMM 主路径必须使用 FP8 dispatch output + activation scale。方案 2 的 BF16 dispatch 只是隔离 masked DeepGEMM preprocess 的实验对照：它会在本地重新生成 FP8 activation 和 scale，语义重复且不应产品化。方案 1 保持 FP8 dispatch，方向更干净；严格 correctness 证明旧 `SGLANG_OPT_FIX_MEGA_MOE_MEMORY=1` + swizzle=True 会产生错误输出。当前已在 EPv2 contiguous adapter 下禁用 swizzled activation reader，strict chat correctness 通过；性能/profile 需要重新复测。
 
 2026-06-17 更新：参考 DeepEP v2 `dispatch_copy_epilogue_impl` 源码确认，EPv2 dispatch epilogue 已经把 global expert id 转成 local expert id，并把非本 rank 选择写为 `-1`。因此 SGLang 侧删除了 `_to_local_topk_ids()` 的 `max().item()` 分支，避免 decode 热路径上的 GPU->CPU sync。注意：此前基于 `SGLANG_OPT_FIX_MEGA_MOE_MEMORY=1` + swizzle=True 的 `804.54 output tok/s / 154.68 ms TPOT` 已被 correctness 判定为无效。后续补充 no-swizzle guard 后，`FIX_MEGA=1` strict chat correctness 通过，但性能/profile 尚未重测。
+
+2026-06-17 更新：EPv2 DeepGEMM FP8 路径改为默认使用 native expanded layout。源码依据是 `ElasticBuffer.dispatch(do_expand=True)` 与 `dispatch_copy_epilogue_impl<kDoExpand>`：跨 rank dispatch 仍按目标 rank 接收 token，copy epilogue 在目标 rank 本地把 received token 写成 one-row-per-local-expert-slot 的 `recv_x`。这与 DeepGEMM 的 expert-major grouped activation 更匹配，可以跳过 SGLang adapter 中的 `ep_scatter/ep_gather`。H20 8 卡 decode-like `ISL=1/OSL=1024/CC=128/capacity=1024` strict correctness PASS；无实验开关正式默认路径下，output tok/s 从 corrected baseline `808.29` 提升到 `862.24`，约 +6.7%；相比 corrected DeepEP LL `953.93` 仍慢约 9.6%。日志：`/root/menyu/logs/epv2_correctness_expand_default_20260617_060832` 和 `/root/menyu/logs/deepep_epv2_expand_default_bench_epv2_isl1_osl1024_cc128_20260617_061244`。
 
 详细过程和日志保存在源码树外：
 

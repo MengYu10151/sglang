@@ -960,7 +960,11 @@ def pre_permute_epv2_to_deep_gemm(
     runner_config: MoeRunnerConfig,
     running_state: dict,
 ) -> DeepGemmRunnerInput:
-    from sglang.srt.layers.moe.ep_moe.kernels import ep_scatter
+    from sglang.srt.layers.moe.ep_moe.kernels import (
+        ep_expand_init_m_indices_from_psum,
+        ep_scatter,
+        ep_scatter_from_psum,
+    )
 
     (
         hidden_states,
@@ -968,6 +972,8 @@ def pre_permute_epv2_to_deep_gemm(
         topk_ids,
         topk_weights,
         num_recv_tokens_per_expert,
+        psum_num_recv_tokens_per_expert,
+        is_expanded,
     ) = dispatch_output
     if hidden_states_scale is None:
         raise RuntimeError(
@@ -982,10 +988,38 @@ def pre_permute_epv2_to_deep_gemm(
         running_state["epv2_disable_contig_swizzle"] = True
     assert runner_config.activation == "silu"
 
-    num_recv_tokens_per_expert = [
-        ceil_div(x, 128) * 128 for x in num_recv_tokens_per_expert
-    ]
-    all_tokens = sum(num_recv_tokens_per_expert)
+    if is_expanded:
+        if psum_num_recv_tokens_per_expert is None:
+            raise RuntimeError("EPv2 expanded layout requires native expert prefix sums.")
+        all_tokens = hidden_states.shape[0]
+        running_state["all_tokens"] = all_tokens
+        running_state["hidden_states_shape"] = hidden_states.shape
+        running_state["hidden_states_device"] = hidden_states.device
+        running_state["hidden_states_dtype"] = hidden_states.dtype
+        running_state["topk_ids"] = None
+        running_state["topk_weights"] = topk_weights
+        running_state["epv2_expanded"] = True
+
+        m_indices = torch.empty(all_tokens, device=hidden_states.device, dtype=torch.int32)
+        ep_expand_init_m_indices_from_psum(psum_num_recv_tokens_per_expert, m_indices)
+        return DeepGemmRunnerInput(
+            hidden_states=hidden_states,
+            hidden_states_scale=hidden_states_scale,
+            use_masked_gemm=False,
+            m_indices=m_indices,
+        )
+
+    if psum_num_recv_tokens_per_expert is not None:
+        all_tokens = int(psum_num_recv_tokens_per_expert[-1].item())
+        num_recv_tokens_per_expert_gpu = None
+    else:
+        num_recv_tokens_per_expert = [
+            ceil_div(x, 128) * 128 for x in num_recv_tokens_per_expert
+        ]
+        all_tokens = sum(num_recv_tokens_per_expert)
+        num_recv_tokens_per_expert_gpu = torch.tensor(
+            num_recv_tokens_per_expert, dtype=torch.int32, pin_memory=True, device="cpu"
+        ).cuda(non_blocking=True)
     K = hidden_states.shape[1]
     running_state["all_tokens"] = all_tokens
     running_state["hidden_states_shape"] = hidden_states.shape
@@ -1009,23 +1043,34 @@ def pre_permute_epv2_to_deep_gemm(
         )
     m_indices = torch.empty(all_tokens, device=hidden_states.device, dtype=torch.int32)
     output_index = torch.empty_like(topk_ids)
-    num_recv_tokens_per_expert_gpu = torch.tensor(
-        num_recv_tokens_per_expert, dtype=torch.int32, pin_memory=True, device="cpu"
-    ).cuda(non_blocking=True)
-    expert_start_loc = torch.empty_like(num_recv_tokens_per_expert_gpu)
-
-    ep_scatter(
-        hidden_states,
-        hidden_states_scale,
-        topk_ids,
-        num_recv_tokens_per_expert_gpu,
-        expert_start_loc,
-        input_tensor,
-        input_tensor_scale,
-        m_indices,
-        output_index,
-        scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-    )
+    if psum_num_recv_tokens_per_expert is not None:
+        expert_start_loc = torch.empty_like(psum_num_recv_tokens_per_expert)
+        ep_scatter_from_psum(
+            hidden_states,
+            hidden_states_scale,
+            topk_ids,
+            psum_num_recv_tokens_per_expert,
+            expert_start_loc,
+            input_tensor,
+            input_tensor_scale,
+            m_indices,
+            output_index,
+            scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+        )
+    else:
+        expert_start_loc = torch.empty_like(num_recv_tokens_per_expert_gpu)
+        ep_scatter(
+            hidden_states,
+            hidden_states_scale,
+            topk_ids,
+            num_recv_tokens_per_expert_gpu,
+            expert_start_loc,
+            input_tensor,
+            input_tensor_scale,
+            m_indices,
+            output_index,
+            scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+        )
     dispose_tensor(hidden_states)
     dispose_tensor(hidden_states_scale)
     running_state["output_index"] = output_index
@@ -1047,6 +1092,15 @@ def post_permute_deep_gemm_to_epv2(
 ) -> EpV2CombineInput:
     from sglang.srt.layers.moe.ep_moe.kernels import ep_gather
     from sglang.srt.layers.moe.token_dispatcher.epv2 import EpV2CombineInput
+
+    if running_state.get("epv2_expanded", False):
+        hidden_states = runner_output.hidden_states
+        topk_weights = running_state["topk_weights"]
+        if topk_weights is not None:
+            hidden_states = hidden_states * topk_weights.to(
+                hidden_states.dtype
+            ).unsqueeze(-1)
+        return EpV2CombineInput(hidden_states, None, None)
 
     hidden_states = runner_output.hidden_states
     topk_ids = running_state["topk_ids"]

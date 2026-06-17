@@ -172,6 +172,7 @@ class EpV2RunnerCapability(NamedTuple):
     output_dtype: EpV2OutputDtype
     expert_alignment: int
     fp8_scale_ue8m0: bool = False
+    use_expanded_layout: bool = False
 
 
 class DeepEPMode(Enum):
@@ -321,12 +322,15 @@ def get_epv2_runner_capability(self) -> EpV2RunnerCapability:
             )
         from sglang.srt.layers import deep_gemm_wrapper
 
-        # The currently supported FP8 adapter is DeepGEMM, whose expert-major
-        # input path requires 128-token expert alignment and DeepGEMM scale layout.
+        # DeepGEMM consumes expert-major grouped activations. Use EPv2's
+        # native expanded layout so the dispatcher copy epilogue writes one
+        # row per local expert slot, avoiding an extra SGLang scatter/gather
+        # adapter round-trip on the decode path.
         return EpV2RunnerCapability(
             output_dtype=output_dtype,
             expert_alignment=128,
             fp8_scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+            use_expanded_layout=True,
         )
     if not runner_backend.is_triton():
         raise ValueError(
