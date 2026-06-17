@@ -228,6 +228,9 @@ class DeepGemmRunnerCore(MoeRunnerCore):
 
         if envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.get():
             swiglu_limit_arg: Optional[float] = self.swiglu_limit
+            use_contig_swizzle = self.use_swizzle and not running_state.get(
+                "epv2_disable_contig_swizzle", False
+            )
 
             down_input_fp8 = torch.empty(
                 (all_tokens, N // 2),
@@ -250,7 +253,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
                 transposed=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
                 swiglu_limit=swiglu_limit_arg,
-                swizzle=self.use_swizzle,
+                swizzle=use_contig_swizzle,
             )
             del gateup_output
         else:
@@ -972,11 +975,11 @@ def pre_permute_epv2_to_deep_gemm(
             "Use --epv2-dispatcher-output-dtype fp8 or select a BF16 runner such as triton."
         )
     if envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.get():
-        raise RuntimeError(
-            "SGLANG_OPT_FIX_MEGA_MOE_MEMORY is currently not validated with "
-            "DeepEP v2 -> DeepGEMM. It can produce incorrect generation output; "
-            "disable it until the EPv2 contiguous activation path is fixed."
-        )
+        # The MegaMoE memory optimization enables a swizzled activation kernel
+        # for its gran=8 interleaved gate/up layout. EPv2's contiguous adapter
+        # is validated with the non-swizzled activation layout; using the
+        # swizzled reader here mixes gate/up pairs and breaks generation.
+        running_state["epv2_disable_contig_swizzle"] = True
     assert runner_config.activation == "silu"
 
     num_recv_tokens_per_expert = [

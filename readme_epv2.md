@@ -206,8 +206,8 @@ DP-attention 设置，均关闭 CUDA graph 与 TBO/SBO，`max_prefill_tokens=819
 | DeepEP | low_latency | 1024 | 128 | 953.93 | 129.27 ms | 1796.47 ms | PASS，corrected baseline：`SGLANG_OPT_SWIGLU_CLAMP_FUSION=true` |
 | EPv2 | direct | 1024 | 128 | 730.17 | 170.77 ms | 1319.88 ms | PASS，当前默认路径 |
 | EPv2 | direct | 1024 | 128 | 774.37 | 160.88 ms | 1255.55 ms | EXPERIMENT，BF16 dispatch + masked DeepGEMM preprocess，本地重新量化；仅作隔离对照，不是 DeepGEMM 主路径 |
-| EPv2 | direct | 1024 | 128 | 760.72 | 163.76 ms | 1278.87 ms | INVALID，实验方案 1：FP8 dispatch + fused contiguous activation，后续 correctness 发现输出错误 |
-| EPv2 | direct | 1024 | 128 | 804.54 | 154.68 ms | 1234.64 ms | INVALID，实验方案 1 + topk sync fix，后续 correctness 发现输出错误，不作为性能结论 |
+| EPv2 | direct | 1024 | 128 | 760.72 | 163.76 ms | 1278.87 ms | INVALID，旧实验方案 1：FP8 dispatch + fused contiguous activation + swizzle=True，correctness 失败 |
+| EPv2 | direct | 1024 | 128 | 804.54 | 154.68 ms | 1234.64 ms | INVALID，旧实验方案 1 + topk sync fix + swizzle=True，correctness 失败，不作为性能结论 |
 
 结论：capacity 对正确性和性能都有明显影响。CC=128 时 runtime 可能发出比单步
 decode 更大的 MoE dispatch batch，因此 capacity=128 不足。capacity 对齐为 1024 后，
@@ -215,9 +215,9 @@ decode 更大的 MoE dispatch batch，因此 capacity=128 不足。capacity 对�
 但 corrected DeepEP LL baseline 使用 `SGLANG_OPT_SWIGLU_CLAMP_FUSION=true` 后，DeepEP LL
 当前快于 EPv2 direct。后续 decode 对比必须同时标注 capacity、VMM 和 swiglu clamp fusion。
 
-补充实验结论：EPv2 原生支持 FP8 dispatch，DeepGEMM 主路径必须使用 FP8 dispatch output + activation scale。方案 2 的 BF16 dispatch 只是隔离 masked DeepGEMM preprocess 的实验对照：它会在本地重新生成 FP8 activation 和 scale，语义重复且不应产品化。方案 1 保持 FP8 dispatch，方向更干净，但严格 correctness 已证明 `SGLANG_OPT_FIX_MEGA_MOE_MEMORY=1` 的 fused contiguous path 会产生错误输出；当前已 fail-fast 禁用，不能作为性能或正确性结论。
+补充实验结论：EPv2 原生支持 FP8 dispatch，DeepGEMM 主路径必须使用 FP8 dispatch output + activation scale。方案 2 的 BF16 dispatch 只是隔离 masked DeepGEMM preprocess 的实验对照：它会在本地重新生成 FP8 activation 和 scale，语义重复且不应产品化。方案 1 保持 FP8 dispatch，方向更干净；严格 correctness 证明旧 `SGLANG_OPT_FIX_MEGA_MOE_MEMORY=1` + swizzle=True 会产生错误输出。当前已在 EPv2 contiguous adapter 下禁用 swizzled activation reader，strict chat correctness 通过；性能/profile 需要重新复测。
 
-2026-06-17 更新：参考 DeepEP v2 `dispatch_copy_epilogue_impl` 源码确认，EPv2 dispatch epilogue 已经把 global expert id 转成 local expert id，并把非本 rank 选择写为 `-1`。因此 SGLang 侧删除了 `_to_local_topk_ids()` 的 `max().item()` 分支，避免 decode 热路径上的 GPU->CPU sync。注意：随后严格 correctness 发现 `SGLANG_OPT_FIX_MEGA_MOE_MEMORY=1` 的 fused contiguous EPv2 path 会产生错误输出，因此基于该 path 的 `804.54 output tok/s / 154.68 ms TPOT` 只作为无效实验记录，不作为可交付性能结论。当前可交付 EPv2 DeepGEMM 路径应关闭 `SGLANG_OPT_FIX_MEGA_MOE_MEMORY`。
+2026-06-17 更新：参考 DeepEP v2 `dispatch_copy_epilogue_impl` 源码确认，EPv2 dispatch epilogue 已经把 global expert id 转成 local expert id，并把非本 rank 选择写为 `-1`。因此 SGLang 侧删除了 `_to_local_topk_ids()` 的 `max().item()` 分支，避免 decode 热路径上的 GPU->CPU sync。注意：此前基于 `SGLANG_OPT_FIX_MEGA_MOE_MEMORY=1` + swizzle=True 的 `804.54 output tok/s / 154.68 ms TPOT` 已被 correctness 判定为无效。后续补充 no-swizzle guard 后，`FIX_MEGA=1` strict chat correctness 通过，但性能/profile 尚未重测。
 
 详细过程和日志保存在源码树外：
 
@@ -275,8 +275,8 @@ DeepEP low_latency 复测必须设置 `NVSHMEM_DISABLE_CUDA_VMM=0`。
 | DeepEP | low_latency | `SGLANG_OPT_SWIGLU_CLAMP_FUSION=true` | 953.93 | 129.27 ms | corrected baseline，当前最快 |
 | EPv2 | direct | capacity=1024 | 730.17 | 170.77 ms | 慢于 corrected DeepEP LL，当前默认路径 |
 | EPv2 | direct | BF16 masked experiment | 774.37 | 160.88 ms | 仅作隔离对照；DeepGEMM 主路径不应使用 BF16 dispatch 后二次量化 |
-| EPv2 | direct | fused contiguous + empty guard | 760.72 | 163.76 ms | INVALID，严格 correctness 失败 |
-| EPv2 | direct | topk sync fix + fused contiguous | 804.54 | 154.68 ms | INVALID，严格 correctness 失败 |
+| EPv2 | direct | fused contiguous + empty guard, swizzle=True | 760.72 | 163.76 ms | INVALID，严格 correctness 失败 |
+| EPv2 | direct | topk sync fix + fused contiguous, swizzle=True | 804.54 | 154.68 ms | INVALID，严格 correctness 失败 |
 
 profile 结论：
 
@@ -284,11 +284,11 @@ profile 结论：
 - DeepEP LL fusion=true 后，大 clamp 消失，swiglu clamp median 降到约 `0.02 ms/rank`，activation/quant 约 `14.70 ms/rank`。
 - EPv2 direct 走 contiguous adapter，swiglu clamp shape 是 actual-token 规模，通常 `[1536~2944, 2048]`，median 约 `8.70 ms/rank`；但 DeepGEMM/adapter 路径整体仍慢于 corrected DeepEP LL。
 - topk sync fix 后，`_to_local_topk_ids()` 从 trace 消失；但对应 profile/bench 使用了后续证明 correctness 失败的 `SGLANG_OPT_FIX_MEGA_MOE_MEMORY=1` path，因此不能作为有效性能结论。
-- 当前有效 correctness 路径是 EPv2 FP8 dispatch + DeepGEMM，且 `SGLANG_OPT_FIX_MEGA_MOE_MEMORY=0`。后续需要在该正确路径上重新测性能和 profile。
+- 当前有效 correctness 路径包括 EPv2 FP8 dispatch + DeepGEMM + `SGLANG_OPT_FIX_MEGA_MOE_MEMORY=0`，以及 `FIX_MEGA=1` + EPv2 no-swizzle guard。后者刚通过 strict chat correctness，性能/profile 仍需重测。
 - DeepEP LL 和 EPv2 direct 的 EP dispatch kernel 在 torch profiler 中都是 long-running/waiting 型通信 kernel，不能把 trace duration 直接等价为单步计算耗时。
 - 因此 decode/direct 场景里，EPv2 相比旧 DeepEP wrapper 有收益，但相比 corrected DeepEP LL baseline 仍需要优化。
 - 实验方案 2 只说明 masked DeepGEMM 路径本身可作为参考；但 EPv2 BF16 dispatch 后重新 preprocess/quant 会重复搬运和量化 activation。由于 EPv2 原生支持 FP8 dispatch + scales，DeepGEMM 主路径应直接消费 FP8 dispatch output。
-- 实验方案 1 的 fused contiguous activation 不仅有 empty-token rank 问题；严格 correctness 还发现非空路径也会产生错误输出。当前已对 EPv2 + DeepGEMM + `SGLANG_OPT_FIX_MEGA_MOE_MEMORY=1` 做 fail-fast，后续需重新 debug 后才能启用。
+- 实验方案 1 的 fused contiguous activation 失败根因收敛到 swizzled activation reader：MegaMoE 的 swizzle=True 假设 gran=8 interleaved gate/up，EPv2 contiguous adapter 需要禁用该 reader。no-swizzle guard 已通过 strict chat correctness。
 
 ### 当前性能判断
 
@@ -302,7 +302,7 @@ profile 结论：
 
 - 对 DSv4 Flash FP8，raw `/generate` 输入普通中文 prompt 时，DeepEP 与 EPv2 都会出现文件名/模板碎片；该模型本地 `tokenizer_config.json` 没有 `chat_template` 字段，不能把 plain prompt raw completion 当作 strict chat correctness。
 - Strict correctness 使用 `/v1/chat/completions`。同一三组 prompt 下，DeepEP LL 与 EPv2 direct (`SGLANG_OPT_FIX_MEGA_MOE_MEMORY=0`) 均输出正确答案。raw `/generate` 不再标记为 correctness PASS，只能作为底层接口 smoke。
-- EPv2 direct + `SGLANG_OPT_FIX_MEGA_MOE_MEMORY=1` 在同一 chat correctness 下输出乱码，因此该路径已禁用。模板化 `/generate` 复核见 `/root/menyu/logs/epv2_template_generate_20260617_022510`，HF tokenizer 因缺少 `chat_template` 无法生成标准模板。
+- EPv2 direct + `SGLANG_OPT_FIX_MEGA_MOE_MEMORY=1` 原 swizzle=True 路径在同一 chat correctness 下输出乱码；no-swizzle guard 后三组 chat correctness 通过，日志 `/root/menyu/logs/epv2_correctness_epv2_fixmega_noswizzle_20260617_023626`。模板化 `/generate` 复核见 `/root/menyu/logs/epv2_template_generate_20260617_022510`，HF tokenizer 因缺少 `chat_template` 无法生成标准模板。
 
 ## 已知限制
 
@@ -310,7 +310,7 @@ profile 结论：
 - TBO/SBO overlap hooks 尚未实现，server 启动阶段会直接拒绝。
 - CUDA graph 当前对 EPv2 关闭，后续需要验证 graph capture 安全性。
 - Shared expert fusion 当前对 EPv2 关闭，后续需要单独验证 fused path。
-- Decode 场景存在 empty-token rank。虽然 fused contiguous activation 已补 `all_tokens == 0` guard，但严格 correctness 发现该路径仍会产生错误输出；当前 EPv2 + DeepGEMM 下启用 `SGLANG_OPT_FIX_MEGA_MOE_MEMORY=1` 会 fail-fast。
+- Decode 场景存在 empty-token rank。fused contiguous activation 已补 `all_tokens == 0` guard；EPv2 下还必须禁用 MegaMoE swizzled activation reader，否则会混淆 gate/up layout 并导致错误输出。
 - E2E capacity 边界测试还不够确定。SGLang scheduler、tokenization、chunked-prefill
   可能在请求进入 EPv2 dispatcher 前就先拦截或切分请求；当前只能用 synthetic
   dispatcher test 覆盖 capacity guard，后续需要 server 内 instrumentation。
