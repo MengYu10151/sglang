@@ -205,9 +205,9 @@ DP-attention 设置，均关闭 CUDA graph 与 TBO/SBO，`max_prefill_tokens=819
 | DeepEP | low_latency | 1024 | 128 | 441.15 | 283.87 ms | 1810.45 ms | PASS，旧 wrapper：`SGLANG_OPT_SWIGLU_CLAMP_FUSION=false` |
 | DeepEP | low_latency | 1024 | 128 | 953.93 | 129.27 ms | 1796.47 ms | PASS，corrected baseline：`SGLANG_OPT_SWIGLU_CLAMP_FUSION=true` |
 | EPv2 | direct | 1024 | 128 | 730.17 | 170.77 ms | 1319.88 ms | PASS，当前默认路径 |
-| EPv2 | direct | 1024 | 128 | 774.37 | 160.88 ms | 1255.55 ms | PASS，实验方案 2：BF16 dispatch + masked DeepGEMM preprocess，本地重新量化 |
-| EPv2 | direct | 1024 | 128 | 760.72 | 163.76 ms | 1278.87 ms | PASS，实验方案 1：FP8 dispatch + fused contiguous activation + empty-token guard |
-| EPv2 | direct | 1024 | 128 | 804.54 | 154.68 ms | 1234.64 ms | PASS，正式优化：复用 EPv2 epilogue local topk 输出，移除冗余 `max().item()` CPU sync |
+| EPv2 | direct | 1024 | 128 | 774.37 | 160.88 ms | 1255.55 ms | EXPERIMENT，BF16 dispatch + masked DeepGEMM preprocess，本地重新量化；仅作隔离对照，不是 DeepGEMM 主路径 |
+| EPv2 | direct | 1024 | 128 | 760.72 | 163.76 ms | 1278.87 ms | INVALID，实验方案 1：FP8 dispatch + fused contiguous activation，后续 correctness 发现输出错误 |
+| EPv2 | direct | 1024 | 128 | 804.54 | 154.68 ms | 1234.64 ms | INVALID，实验方案 1 + topk sync fix，后续 correctness 发现输出错误，不作为性能结论 |
 
 结论：capacity 对正确性和性能都有明显影响。CC=128 时 runtime 可能发出比单步
 decode 更大的 MoE dispatch batch，因此 capacity=128 不足。capacity 对齐为 1024 后，
@@ -215,9 +215,9 @@ decode 更大的 MoE dispatch batch，因此 capacity=128 不足。capacity 对�
 但 corrected DeepEP LL baseline 使用 `SGLANG_OPT_SWIGLU_CLAMP_FUSION=true` 后，DeepEP LL
 当前快于 EPv2 direct。后续 decode 对比必须同时标注 capacity、VMM 和 swiglu clamp fusion。
 
-补充实验结论：方案 2 通过 BF16 dispatch 后重新进入 masked DeepGEMM preprocess，性能略高于当前默认 EPv2 direct，但引入本地二次量化和额外 adapter 语义，不适合作为优先产品化方向。方案 1 保持 FP8 dispatch，方向更干净，但当前需要补 empty-token rank guard 才能避免 `silu_and_mul_contig_post_quant` 对 `num_tokens=0` launch 时报 `CUDA error: invalid argument`，且性能仍低于 corrected DeepEP LL。
+补充实验结论：EPv2 原生支持 FP8 dispatch，DeepGEMM 主路径必须使用 FP8 dispatch output + activation scale。方案 2 的 BF16 dispatch 只是隔离 masked DeepGEMM preprocess 的实验对照：它会在本地重新生成 FP8 activation 和 scale，语义重复且不应产品化。方案 1 保持 FP8 dispatch，方向更干净，但严格 correctness 已证明 `SGLANG_OPT_FIX_MEGA_MOE_MEMORY=1` 的 fused contiguous path 会产生错误输出；当前已 fail-fast 禁用，不能作为性能或正确性结论。
 
-2026-06-17 更新：参考 DeepEP v2 `dispatch_copy_epilogue_impl` 源码确认，EPv2 dispatch epilogue 已经把 global expert id 转成 local expert id，并把非本 rank 选择写为 `-1`。因此 SGLang 侧删除了 `_to_local_topk_ids()` 的 `max().item()` 分支，避免 decode 热路径上的 GPU->CPU sync。该优化后 EPv2 direct decode 提升到 `804.54 output tok/s / 154.68 ms TPOT`，但仍慢于 corrected DeepEP LL 的 `953.93 output tok/s / 129.27 ms TPOT`。
+2026-06-17 更新：参考 DeepEP v2 `dispatch_copy_epilogue_impl` 源码确认，EPv2 dispatch epilogue 已经把 global expert id 转成 local expert id，并把非本 rank 选择写为 `-1`。因此 SGLang 侧删除了 `_to_local_topk_ids()` 的 `max().item()` 分支，避免 decode 热路径上的 GPU->CPU sync。注意：随后严格 correctness 发现 `SGLANG_OPT_FIX_MEGA_MOE_MEMORY=1` 的 fused contiguous EPv2 path 会产生错误输出，因此基于该 path 的 `804.54 output tok/s / 154.68 ms TPOT` 只作为无效实验记录，不作为可交付性能结论。当前可交付 EPv2 DeepGEMM 路径应关闭 `SGLANG_OPT_FIX_MEGA_MOE_MEMORY`。
 
 详细过程和日志保存在源码树外：
 
@@ -274,21 +274,21 @@ DeepEP low_latency 复测必须设置 `NVSHMEM_DISABLE_CUDA_VMM=0`。
 | DeepEP | low_latency | `SGLANG_OPT_SWIGLU_CLAMP_FUSION=false` | 441.49 | 283.87 ms | 旧 wrapper，非公平 baseline |
 | DeepEP | low_latency | `SGLANG_OPT_SWIGLU_CLAMP_FUSION=true` | 953.93 | 129.27 ms | corrected baseline，当前最快 |
 | EPv2 | direct | capacity=1024 | 730.17 | 170.77 ms | 慢于 corrected DeepEP LL，当前默认路径 |
-| EPv2 | direct | BF16 masked experiment | 774.37 | 160.88 ms | 实验方案 2，略快于默认但需本地重新量化 |
-| EPv2 | direct | fused contiguous + empty guard | 760.72 | 163.76 ms | 实验方案 1，需修 empty-token rank 后才可用 |
-| EPv2 | direct | topk sync fix + fused contiguous | 804.54 | 154.68 ms | 正式优化，删除冗余 `_to_local_topk_ids()` CPU sync |
+| EPv2 | direct | BF16 masked experiment | 774.37 | 160.88 ms | 仅作隔离对照；DeepGEMM 主路径不应使用 BF16 dispatch 后二次量化 |
+| EPv2 | direct | fused contiguous + empty guard | 760.72 | 163.76 ms | INVALID，严格 correctness 失败 |
+| EPv2 | direct | topk sync fix + fused contiguous | 804.54 | 154.68 ms | INVALID，严格 correctness 失败 |
 
 profile 结论：
 
 - DeepEP LL fusion=false 的主要异常是 `_apply_swiglu_limit` 对 `[262144, 2048]` padded tensor 做单独 `torch.clamp`，全 rank median 约 `1023.68 ms/rank`。
 - DeepEP LL fusion=true 后，大 clamp 消失，swiglu clamp median 降到约 `0.02 ms/rank`，activation/quant 约 `14.70 ms/rank`。
 - EPv2 direct 走 contiguous adapter，swiglu clamp shape 是 actual-token 规模，通常 `[1536~2944, 2048]`，median 约 `8.70 ms/rank`；但 DeepGEMM/adapter 路径整体仍慢于 corrected DeepEP LL。
-- topk sync fix 后，`_to_local_topk_ids()` 从 trace 消失，`step[DECODE]` median 从 `284.45 ms` 降到 `269.79 ms`，非 profiler 吞吐提升到 `804.54 tok/s`。
-- topk sync fix 后剩余 gap 主要在 adapter：`pre_permute_epv2_to_deep_gemm` 约 `0.4361 ms/layer`，`post_permute_deep_gemm_to_epv2` 约 `0.1279 ms/layer`，而 DeepEP LL 对应路径基本是 pass-through。
+- topk sync fix 后，`_to_local_topk_ids()` 从 trace 消失；但对应 profile/bench 使用了后续证明 correctness 失败的 `SGLANG_OPT_FIX_MEGA_MOE_MEMORY=1` path，因此不能作为有效性能结论。
+- 当前有效 correctness 路径是 EPv2 FP8 dispatch + DeepGEMM，且 `SGLANG_OPT_FIX_MEGA_MOE_MEMORY=0`。后续需要在该正确路径上重新测性能和 profile。
 - DeepEP LL 和 EPv2 direct 的 EP dispatch kernel 在 torch profiler 中都是 long-running/waiting 型通信 kernel，不能把 trace duration 直接等价为单步计算耗时。
 - 因此 decode/direct 场景里，EPv2 相比旧 DeepEP wrapper 有收益，但相比 corrected DeepEP LL baseline 仍需要优化。
-- 实验方案 2 说明 masked DeepGEMM 路径本身可作为参考，但 EPv2 BF16 dispatch 后重新 preprocess/quant 会重复搬运和量化 activation，设计上不如直接消费 FP8 dispatch output 干净。
-- 实验方案 1 说明 fused contiguous activation 的首要 blocker 是 empty-token rank；需要在正式 adapter 中对 `all_tokens == 0` 做一致语义处理，再继续看 fused kernel 是否能带来稳定收益。
+- 实验方案 2 只说明 masked DeepGEMM 路径本身可作为参考；但 EPv2 BF16 dispatch 后重新 preprocess/quant 会重复搬运和量化 activation。由于 EPv2 原生支持 FP8 dispatch + scales，DeepGEMM 主路径应直接消费 FP8 dispatch output。
+- 实验方案 1 的 fused contiguous activation 不仅有 empty-token rank 问题；严格 correctness 还发现非空路径也会产生错误输出。当前已对 EPv2 + DeepGEMM + `SGLANG_OPT_FIX_MEGA_MOE_MEMORY=1` 做 fail-fast，后续需重新 debug 后才能启用。
 
 ### 当前性能判断
 
@@ -297,13 +297,20 @@ profile 结论：
   SGLang adapter/handle 生命周期/overlap hook/runner 衔接，而不是先假设 native
   EPv2 kernel 本身慢。
 
+
+### Correctness 验证口径
+
+- 对 DSv4 Flash FP8，raw `/generate` 输入普通中文 prompt 时，DeepEP 与 EPv2 都会出现文件名/模板碎片；该模型本地 `tokenizer_config.json` 没有 `chat_template` 字段，不能把 plain prompt raw completion 当作 strict chat correctness。
+- Strict correctness 使用 `/v1/chat/completions`。同一三组 prompt 下，DeepEP LL 与 EPv2 direct (`SGLANG_OPT_FIX_MEGA_MOE_MEMORY=0`) 均输出正确答案。raw `/generate` 不再标记为 correctness PASS，只能作为底层接口 smoke。
+- EPv2 direct + `SGLANG_OPT_FIX_MEGA_MOE_MEMORY=1` 在同一 chat correctness 下输出乱码，因此该路径已禁用。模板化 `/generate` 复核见 `/root/menyu/logs/epv2_template_generate_20260617_022510`，HF tokenizer 因缺少 `chat_template` 无法生成标准模板。
+
 ## 已知限制
 
 - EPv2 当前只支持 DeepGEMM FP8 与 Triton BF16 两条 runner adapter。
 - TBO/SBO overlap hooks 尚未实现，server 启动阶段会直接拒绝。
 - CUDA graph 当前对 EPv2 关闭，后续需要验证 graph capture 安全性。
 - Shared expert fusion 当前对 EPv2 关闭，后续需要单独验证 fused path。
-- Decode 场景存在 empty-token rank。fused contiguous activation 路径已补 `all_tokens == 0` guard，避免空 token rank 进入 `silu_and_mul_contig_post_quant` 的 zero-size kernel launch；后续还需要更完整的 corner-case 矩阵覆盖。
+- Decode 场景存在 empty-token rank。虽然 fused contiguous activation 已补 `all_tokens == 0` guard，但严格 correctness 发现该路径仍会产生错误输出；当前 EPv2 + DeepGEMM 下启用 `SGLANG_OPT_FIX_MEGA_MOE_MEMORY=1` 会 fail-fast。
 - E2E capacity 边界测试还不够确定。SGLang scheduler、tokenization、chunked-prefill
   可能在请求进入 EPv2 dispatcher 前就先拦截或切分请求；当前只能用 synthetic
   dispatcher test 覆盖 capacity guard，后续需要 server 内 instrumentation。

@@ -971,6 +971,12 @@ def pre_permute_epv2_to_deep_gemm(
             "DeepEP v2 -> DeepGEMM requires FP8 dispatch output with activation scales. "
             "Use --epv2-dispatcher-output-dtype fp8 or select a BF16 runner such as triton."
         )
+    if envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.get():
+        raise RuntimeError(
+            "SGLANG_OPT_FIX_MEGA_MOE_MEMORY is currently not validated with "
+            "DeepEP v2 -> DeepGEMM. It can produce incorrect generation output; "
+            "disable it until the EPv2 contiguous activation path is fixed."
+        )
     assert runner_config.activation == "silu"
 
     num_recv_tokens_per_expert = [
