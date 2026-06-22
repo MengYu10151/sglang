@@ -171,6 +171,7 @@ class EpV2RunnerCapability(NamedTuple):
 
     output_dtype: EpV2OutputDtype
     expert_alignment: int
+    fp8_scale_tma_aligned: bool = False
     fp8_scale_ue8m0: bool = False
     use_expanded_layout: bool = False
 
@@ -329,6 +330,10 @@ def get_epv2_runner_capability(self) -> EpV2RunnerCapability:
         return EpV2RunnerCapability(
             output_dtype=output_dtype,
             expert_alignment=128,
+            fp8_scale_tma_aligned=(
+                deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES
+                or deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+            ),
             fp8_scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
             use_expanded_layout=True,
         )

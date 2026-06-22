@@ -98,6 +98,7 @@ class DeepGemmRunnerInput(RunnerInput):
     masked_m: Optional[torch.Tensor] = None
     expected_m: Optional[int] = None
     m_indices: Optional[torch.Tensor] = None
+    hidden_states_scale_tma_aligned: bool = False
 
     @property
     def runner_backend(self) -> MoeRunnerBackend:
@@ -211,7 +212,10 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             device=hidden_states_device,
             dtype=torch.bfloat16,
         )
-        if deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES:
+        if (
+            deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES
+            and not runner_input.hidden_states_scale_tma_aligned
+        ):
             hidden_states_scale = tma_align_input_scale(hidden_states_scale)
 
         deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_contig(
@@ -974,6 +978,7 @@ def pre_permute_epv2_to_deep_gemm(
         num_recv_tokens_per_expert,
         psum_num_recv_tokens_per_expert,
         is_expanded,
+        hidden_states_scale_tma_aligned,
     ) = dispatch_output
     if hidden_states_scale is None:
         raise RuntimeError(
@@ -1007,6 +1012,7 @@ def pre_permute_epv2_to_deep_gemm(
             hidden_states_scale=hidden_states_scale,
             use_masked_gemm=False,
             m_indices=m_indices,
+            hidden_states_scale_tma_aligned=hidden_states_scale_tma_aligned,
         )
 
     if psum_num_recv_tokens_per_expert is not None:
@@ -1097,6 +1103,9 @@ def post_permute_deep_gemm_to_epv2(
         hidden_states = runner_output.hidden_states
         topk_weights = running_state["topk_weights"]
         if topk_weights is not None:
+            # Expanded combine does not consume top-k weights, so apply them to
+            # each expert slot before combine. Keep this out-of-place until the
+            # runner/communication buffer reuse contract is explicitly audited.
             hidden_states = hidden_states * topk_weights.to(
                 hidden_states.dtype
             ).unsqueeze(-1)

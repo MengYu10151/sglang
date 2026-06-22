@@ -54,6 +54,7 @@ class EpV2DispatchOutput(NamedTuple):
     num_recv_tokens_per_expert: List[int]
     psum_num_recv_tokens_per_expert: Optional[torch.Tensor] = None
     is_expanded: bool = False
+    hidden_states_scale_tma_aligned: bool = False
 
     @property
     def format(self) -> DispatchOutputFormat:
@@ -128,8 +129,8 @@ def _quantize_for_epv2_dispatch(
     return sglang_per_token_group_quant_fp8(
         hidden_states,
         _SCALE_BLOCK_SIZE,
-        column_major_scales=capability.fp8_scale_ue8m0,
-        scale_tma_aligned=capability.fp8_scale_ue8m0,
+        column_major_scales=capability.fp8_scale_tma_aligned,
+        scale_tma_aligned=capability.fp8_scale_tma_aligned,
         scale_ue8m0=capability.fp8_scale_ue8m0,
     )
 
@@ -267,11 +268,16 @@ class _EpV2Impl:
         topk_ids = topk_output.topk_ids.to(torch.int64)
         self._validate_common(hidden_states, topk_ids)
         self._num_input_tokens = hidden_states.shape[0]
-        use_expand_layout = self.capability.use_expanded_layout
+        # EPv2 native expanded layout is profitable for direct/decode-like
+        # DeepGEMM FP8 workloads, but regresses hybrid/prefill-like workloads.
+        # Keep hybrid on the native default non-expanded layout.
+        use_expand_layout = (
+            self.capability.use_expanded_layout and not _get_allow_hybrid_mode()
+        )
 
         if self._uses_fp8_dispatch_output():
             dispatch_x = _quantize_for_epv2_dispatch(hidden_states, self.capability)
-            use_tma_aligned_col_major_sf = self.capability.fp8_scale_ue8m0
+            use_tma_aligned_col_major_sf = self.capability.fp8_scale_tma_aligned
         else:
             dispatch_x = hidden_states
             use_tma_aligned_col_major_sf = False
@@ -285,9 +291,11 @@ class _EpV2Impl:
             num_experts=self.num_experts,
             num_max_tokens_per_rank=self.num_max_dispatch_tokens_per_rank,
             expert_alignment=self.capability.expert_alignment,
+            num_sms=envs.SGLANG_EPV2_NUM_SMS.get(),
             use_tma_aligned_col_major_sf=use_tma_aligned_col_major_sf,
-            # None keeps ElasticBuffer's documented default: CPU sync is used
-            # for a fresh handle so exact receive counts are available.
+            # Keep ElasticBuffer's documented default CPU sync for fresh
+            # handles. Disabling it failed correctness; the expanded path only
+            # skips adapter-side exact-count reads after dispatch returns.
             do_cpu_sync=None,
             do_expand=use_expand_layout,
         )
@@ -301,13 +309,16 @@ class _EpV2Impl:
             recv_hidden_states = recv_x
             recv_hidden_states_scale = None
 
-        num_recv_tokens = int(handle.psum_num_recv_tokens_per_scaleup_rank[-1].item())
         if use_expand_layout:
             # Expanded layout already has one row per local expert slot. There is
             # no recv_topk_idx tensor in this native layout; combine uses handle
             # metadata and expects top-k weights to be applied before combine.
+            # Avoid exact-count CPU reads that are only needed by non-expanded
+            # slicing/scatter paths.
             local_topk_ids = None
+            num_recv_tokens_per_expert = []
         else:
+            num_recv_tokens = int(handle.psum_num_recv_tokens_per_scaleup_rank[-1].item())
             recv_topk_idx = recv_topk_idx[:num_recv_tokens]
             recv_topk_weights = recv_topk_weights[:num_recv_tokens]
             recv_hidden_states = recv_hidden_states[:num_recv_tokens]
@@ -318,7 +329,7 @@ class _EpV2Impl:
             # expert ids and marks non-local choices as -1. Keep it on-GPU and avoid
             # an unnecessary max().item() synchronization in the decode path.
             local_topk_ids = recv_topk_idx
-        num_recv_tokens_per_expert = list(handle.num_recv_tokens_per_expert_list)
+            num_recv_tokens_per_expert = list(handle.num_recv_tokens_per_expert_list)
 
         return EpV2DispatchOutput(
             recv_hidden_states,
@@ -328,6 +339,7 @@ class _EpV2Impl:
             num_recv_tokens_per_expert,
             handle.psum_num_recv_tokens_per_expert,
             use_expand_layout,
+            use_tma_aligned_col_major_sf,
         )
 
     def combine(self, combine_input: EpV2CombineInput) -> torch.Tensor:

@@ -26,6 +26,7 @@ If you only need to use the distributed environment without model/pipeline
 
 import contextlib
 import gc
+import inspect
 import logging
 import os
 import pickle
@@ -1814,7 +1815,7 @@ def init_distributed_environment(
             pg_options = get_torch_distributed_pg_options()
 
         # this backend is used for WORLD
-        torch.distributed.init_process_group(
+        init_process_group_kwargs = dict(
             backend=backend,
             init_method=distributed_init_method,
             world_size=world_size,
@@ -1822,6 +1823,23 @@ def init_distributed_environment(
             timeout=timeout,
             pg_options=pg_options,
         )
+        if (
+            backend == "nccl"
+            and moe_a2a_backend == "epv2"
+            and "device_id"
+            in inspect.signature(torch.distributed.init_process_group).parameters
+        ):
+            init_local_rank = local_rank
+            if init_local_rank == -1:
+                if distributed_init_method == "env://":
+                    init_local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+                else:
+                    init_local_rank = rank
+            if init_local_rank >= 0:
+                init_process_group_kwargs["device_id"] = torch.device(
+                    f"cuda:{init_local_rank}"
+                )
+        torch.distributed.init_process_group(**init_process_group_kwargs)
 
         # Create a global TCPStore for coordination (used by NIXL)
         if moe_a2a_backend == "nixl":

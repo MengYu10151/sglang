@@ -575,6 +575,8 @@ class Envs:
     # semantic token limit; large prefill/chunked-prefill workloads may need a
     # larger value.
     SGLANG_EPV2_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
+    # 0 lets DeepEP v2 ElasticBuffer choose the communication SM count.
+    SGLANG_EPV2_NUM_SMS = EnvInt(0)
     # Compatibility fallback for synthetic tests that instantiate the EPv2
     # dispatcher without ServerArgs. Prefer --epv2-mode in server runs.
     SGLANG_EPV2_ALLOW_HYBRID_MODE = EnvBool(False)
