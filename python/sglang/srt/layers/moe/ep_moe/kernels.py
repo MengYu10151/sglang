@@ -1783,8 +1783,14 @@ def _fwd_kernel_expand_to_masked_slab(
             vs = tl.load(
                 recv_x_scale_ptr + src * recv_x_scale_stride0 + off_s, mask=mask_s
             )
+            # mn-major write: physical layout [E, SCALE_HIDDEN, MAX_M], element
+            # (e, s, j). Viewed as [E, MAX_M, SCALE_HIDDEN] this is the mn-major
+            # TMA-aligned layout deep_gemm wants, so the GEMM-side transpose
+            # (get_mn_major_tma_aligned_tensor) becomes a no-op.
             tl.store(
-                slab_scale_ptr + dst * slab_scale_stride0 + off_s, vs, mask=mask_s
+                slab_scale_ptr + e * SCALE_HIDDEN * MAX_M + off_s * MAX_M + j,
+                vs,
+                mask=mask_s,
             )
 
 
@@ -1809,14 +1815,20 @@ def expand_to_masked_slab(
     overflow = torch.zeros((1,), device=recv_x.device, dtype=torch.int32)
     if is_fp8:
         sh = recv_x_scale.shape[1]
+        # mn-major slab_scale: store physically as [E, sh, max_m] (contiguous),
+        # return a [E, max_m, sh] view with mn-major stride. This matches
+        # deep_gemm's mn-major TMA-aligned scale layout, so the per-layer
+        # get_mn_major_tma_aligned_tensor call on the GEMM side is a no-op.
+        # (That call still runs and would transpose if the layout ever failed to
+        # match, so correctness does not depend on this optimization.)
         slab_scale = torch.empty(
-            (num_local_experts * max_m, sh),
+            (num_local_experts * sh, max_m),
             device=recv_x.device,
             dtype=recv_x_scale.dtype,
         )
         scale_arg = recv_x_scale
         scale_s0 = recv_x_scale.stride(0)
-        slab_scale_s0 = slab_scale.stride(0)
+        slab_scale_s0 = 0  # unused: scale write uses mn-major addressing
     else:
         sh = 1
         slab_scale = None
@@ -1855,7 +1867,8 @@ def expand_to_masked_slab(
         )
     slab = slab.view(num_local_experts, max_m, hidden)
     if is_fp8:
-        slab_scale = slab_scale.view(num_local_experts, max_m, sh)
+        # physical [E, sh, max_m] -> [E, max_m, sh] view with mn-major stride (no copy)
+        slab_scale = slab_scale.view(num_local_experts, sh, max_m).transpose(1, 2)
     return slab, slab_scale, masked_m
 
 
