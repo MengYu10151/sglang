@@ -3802,8 +3802,13 @@ class ServerArgs:
                 )
             self.ep_size = self.tp_size
             self.disable_shared_experts_fusion = True
-            self.cuda_graph_config.decode.backend = Backend.DISABLED
-            self.cuda_graph_config.prefill.backend = Backend.DISABLED
+            # CUDA graph: EPv2 direct-mode decode is capturable (masked GEMM, static
+            # shapes, no host readback). Hybrid mode uses the non-expanded cpu_sync
+            # path which is NOT capturable (cudaErrorStreamCaptureUnjoined), so keep
+            # cuda graph disabled there. (Prefill/extend runs eager either way.)
+            if self.epv2_mode != "direct":
+                self.cuda_graph_config.decode.backend = Backend.DISABLED
+                self.cuda_graph_config.prefill.backend = Backend.DISABLED
             logger.warning(
                 f"DeepEP v2 MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
