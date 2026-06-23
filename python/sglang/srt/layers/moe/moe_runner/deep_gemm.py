@@ -979,6 +979,11 @@ def pre_permute_epv2_to_deep_gemm(
         psum_num_recv_tokens_per_expert,
         is_expanded,
         hidden_states_scale_tma_aligned,
+        epv2_use_masked,
+        epv2_expected_m,
+        epv2_masked_max_m,
+        epv2_total_expanded,
+        epv2_expert_alignment,
     ) = dispatch_output
     if hidden_states_scale is None:
         raise RuntimeError(
@@ -1005,7 +1010,40 @@ def pre_permute_epv2_to_deep_gemm(
         running_state["topk_weights"] = topk_weights
         running_state["epv2_expanded"] = True
 
-        m_indices = torch.empty(all_tokens, device=hidden_states.device, dtype=torch.int32)
+        if epv2_use_masked:
+            # Masked-GEMM bridge: repack the expanded expert-packed buffer into a
+            # regular [E_local, max_m, hidden] slab so DeepGEMM's masked grouped
+            # GEMM bounds compute by per-expert real counts (masked_m), decoupled
+            # from the dispatch capacity. Static shapes -> cuda-graph safe.
+            from sglang.srt.layers.moe.ep_moe.kernels import expand_to_masked_slab
+
+            num_local_experts = psum_num_recv_tokens_per_expert.shape[0]
+            slab, slab_scale, masked_m = expand_to_masked_slab(
+                hidden_states,
+                hidden_states_scale,
+                psum_num_recv_tokens_per_expert,
+                num_local_experts,
+                epv2_masked_max_m,
+                epv2_expert_alignment,
+            )
+            running_state["epv2_masked"] = True
+            running_state["epv2_psum"] = psum_num_recv_tokens_per_expert
+            running_state["epv2_total_expanded"] = epv2_total_expanded
+            running_state["epv2_expert_alignment"] = epv2_expert_alignment
+            return DeepGemmRunnerInput(
+                hidden_states=slab,
+                hidden_states_scale=slab_scale,
+                use_masked_gemm=True,
+                masked_m=masked_m,
+                expected_m=epv2_expected_m,
+                hidden_states_scale_tma_aligned=hidden_states_scale_tma_aligned,
+            )
+
+        # do_cpu_sync=False -> recv buffer is worst-case sized; ep_expand_init only
+        # writes real-token slots, so pre-fill the tail with -1 to skip padding rows.
+        m_indices = torch.full(
+            (all_tokens,), -1, device=hidden_states.device, dtype=torch.int32
+        )
         ep_expand_init_m_indices_from_psum(psum_num_recv_tokens_per_expert, m_indices)
         return DeepGemmRunnerInput(
             hidden_states=hidden_states,
@@ -1102,6 +1140,19 @@ def post_permute_deep_gemm_to_epv2(
     if running_state.get("epv2_expanded", False):
         hidden_states = runner_output.hidden_states
         topk_weights = running_state["topk_weights"]
+        if running_state.get("epv2_masked", False):
+            # Masked path: GEMM output is the [E_local, max_m, hidden] slab. Repack
+            # it back to expanded row order (padding rows zeroed) before combine.
+            from sglang.srt.layers.moe.ep_moe.kernels import masked_slab_to_expand
+
+            hidden_states = masked_slab_to_expand(
+                hidden_states,
+                running_state["epv2_psum"],
+                running_state["epv2_total_expanded"],
+                running_state["epv2_expert_alignment"],
+                topk_weights=topk_weights,
+            )
+            return EpV2CombineInput(hidden_states, None, None)
         if topk_weights is not None:
             # Expanded combine does not consume top-k weights, so apply them to
             # each expert slot before combine. Keep this out-of-place until the

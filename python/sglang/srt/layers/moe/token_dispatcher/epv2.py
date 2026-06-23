@@ -8,6 +8,7 @@ import torch
 import torch.distributed as dist
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.dp_attention import get_is_extend_in_batch
 from sglang.srt.layers.moe.token_dispatcher.base import (
     BaseDispatcher,
     CombineInput,
@@ -55,6 +56,11 @@ class EpV2DispatchOutput(NamedTuple):
     psum_num_recv_tokens_per_expert: Optional[torch.Tensor] = None
     is_expanded: bool = False
     hidden_states_scale_tma_aligned: bool = False
+    use_masked_gemm: bool = False
+    expected_m: int = 0
+    masked_max_m: int = 0
+    total_expanded: int = 0
+    expert_alignment: int = 128
 
     @property
     def format(self) -> DispatchOutputFormat:
@@ -274,13 +280,35 @@ class _EpV2Impl:
         use_expand_layout = (
             self.capability.use_expanded_layout and not _get_allow_hybrid_mode()
         )
+        # decode (non-extend) expanded path -> masked-GEMM bridge: async dispatch
+        # (cpu_sync=False) gives a static capturable recv shape; the masked GEMM
+        # bounds compute by masked_m, so the full (safe) cap costs no extra GEMM.
+        use_masked = use_expand_layout and not get_is_extend_in_batch()
 
         if self._uses_fp8_dispatch_output():
-            dispatch_x = _quantize_for_epv2_dispatch(hidden_states, self.capability)
-            use_tma_aligned_col_major_sf = self.capability.fp8_scale_tma_aligned
+            if use_masked:
+                # _run_masked_gemm consumes plain per-token-group fp32 scales and
+                # does its own e8m0/tma-major alignment, so dispatch a plain
+                # row-major scale (no col-major, no tma, no e8m0 pre-pack).
+                dispatch_x = sglang_per_token_group_quant_fp8(
+                    hidden_states,
+                    _SCALE_BLOCK_SIZE,
+                    column_major_scales=False,
+                    scale_tma_aligned=False,
+                    scale_ue8m0=False,
+                )
+                use_tma_aligned_col_major_sf = False
+            else:
+                dispatch_x = _quantize_for_epv2_dispatch(hidden_states, self.capability)
+                use_tma_aligned_col_major_sf = self.capability.fp8_scale_tma_aligned
         else:
             dispatch_x = hidden_states
             use_tma_aligned_col_major_sf = False
+
+        num_max_tokens = self.num_max_dispatch_tokens_per_rank
+        do_cpu_sync_val = None
+        if use_masked:
+            do_cpu_sync_val = False
 
         buffer = self._get_buffer()
         self._destroy_handle()
@@ -289,14 +317,11 @@ class _EpV2Impl:
             topk_idx=topk_ids,
             topk_weights=topk_weights,
             num_experts=self.num_experts,
-            num_max_tokens_per_rank=self.num_max_dispatch_tokens_per_rank,
+            num_max_tokens_per_rank=num_max_tokens,
             expert_alignment=self.capability.expert_alignment,
             num_sms=envs.SGLANG_EPV2_NUM_SMS.get(),
             use_tma_aligned_col_major_sf=use_tma_aligned_col_major_sf,
-            # Keep ElasticBuffer's documented default CPU sync for fresh
-            # handles. Disabling it failed correctness; the expanded path only
-            # skips adapter-side exact-count reads after dispatch returns.
-            do_cpu_sync=None,
+            do_cpu_sync=do_cpu_sync_val,
             do_expand=use_expand_layout,
         )
         if event.event is not None:
@@ -331,6 +356,18 @@ class _EpV2Impl:
             local_topk_ids = recv_topk_idx
             num_recv_tokens_per_expert = list(handle.num_recv_tokens_per_expert_list)
 
+        expected_m = 0
+        masked_max_m = 0
+        total_expanded = 0
+        if use_masked:
+            expected_m = max(
+                1,
+                (self._num_input_tokens * self.router_topk + self.num_experts)
+                // self.num_experts,
+            )
+            masked_max_m = self.num_max_dispatch_tokens_per_rank
+            total_expanded = recv_hidden_states.shape[0]
+
         return EpV2DispatchOutput(
             recv_hidden_states,
             recv_hidden_states_scale,
@@ -340,6 +377,11 @@ class _EpV2Impl:
             handle.psum_num_recv_tokens_per_expert,
             use_expand_layout,
             use_tma_aligned_col_major_sf,
+            use_masked,
+            expected_m,
+            masked_max_m,
+            total_expanded,
+            self.capability.expert_alignment,
         )
 
     def combine(self, combine_input: EpV2CombineInput) -> torch.Tensor:

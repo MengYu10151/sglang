@@ -1725,3 +1725,195 @@ def fp8_per_token_to_per_tensor_quant_triton(
         K_BLOCK_SIZE=K_BLOCK_SIZE,
         num_warps=8,
     )
+
+
+# ---------------------------------------------------------------------------
+# EPv2 decode masked-GEMM bridge (Claude): repack the expanded expert-packed
+# dispatch buffer into a regular [E_local, max_m, hidden] slab so DeepGEMM's
+# *masked* grouped GEMM can bound compute by per-expert real counts (masked_m)
+# instead of the dispatch capacity. All-GPU, static shapes -> cuda-graph safe.
+# Expanded psum semantics (DeepEP v2): psum[e] = align(psum[e-1], ALIGN) + count_e,
+# so expert e occupies recv rows [align(psum[e-1]) : psum[e]); count_e real tokens.
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _fwd_kernel_expand_to_masked_slab(
+    psum_ptr,
+    recv_x_ptr,
+    recv_x_stride0,
+    recv_x_scale_ptr,
+    recv_x_scale_stride0,
+    slab_ptr,
+    slab_stride0,
+    slab_scale_ptr,
+    slab_scale_stride0,
+    masked_m_ptr,
+    MAX_M: tl.constexpr,
+    ALIGN: tl.constexpr,
+    HIDDEN: tl.constexpr,
+    HIDDEN_PAD: tl.constexpr,
+    SCALE_HIDDEN: tl.constexpr,
+    SCALE_HIDDEN_PAD: tl.constexpr,
+    IS_FP8: tl.constexpr,
+):
+    e = tl.program_id(0)
+    prev_end = tl.load(psum_ptr + e - 1, mask=e > 0, other=0)
+    start = ((prev_end + ALIGN - 1) // ALIGN) * ALIGN
+    end = tl.load(psum_ptr + e)
+    count = end - start
+    count = tl.minimum(count, MAX_M)
+    tl.store(masked_m_ptr + e, count)
+
+    off = tl.arange(0, HIDDEN_PAD)
+    mask = off < HIDDEN
+    off_s = tl.arange(0, SCALE_HIDDEN_PAD)
+    mask_s = off_s < SCALE_HIDDEN
+    for j in range(0, count):
+        src = (start + j).to(tl.int64)
+        dst = (e * MAX_M + j).to(tl.int64)
+        v = tl.load(recv_x_ptr + src * recv_x_stride0 + off, mask=mask)
+        tl.store(slab_ptr + dst * slab_stride0 + off, v, mask=mask)
+        if IS_FP8:
+            vs = tl.load(
+                recv_x_scale_ptr + src * recv_x_scale_stride0 + off_s, mask=mask_s
+            )
+            tl.store(
+                slab_scale_ptr + dst * slab_scale_stride0 + off_s, vs, mask=mask_s
+            )
+
+
+@torch.no_grad()
+def expand_to_masked_slab(
+    recv_x: torch.Tensor,
+    recv_x_scale,
+    psum_num_recv_tokens_per_expert: torch.Tensor,
+    num_local_experts: int,
+    max_m: int,
+    expert_alignment: int,
+):
+    """expanded [total, hidden] -> ([E_local, max_m, hidden], [E_local, max_m, sh] or None, masked_m[E_local])."""
+    hidden = recv_x.shape[1]
+    is_fp8 = recv_x_scale is not None and recv_x.dtype != torch.bfloat16
+    slab = torch.empty(
+        (num_local_experts * max_m, hidden), device=recv_x.device, dtype=recv_x.dtype
+    )
+    masked_m = torch.empty(
+        (num_local_experts,), device=recv_x.device, dtype=torch.int32
+    )
+    if is_fp8:
+        sh = recv_x_scale.shape[1]
+        slab_scale = torch.empty(
+            (num_local_experts * max_m, sh),
+            device=recv_x.device,
+            dtype=recv_x_scale.dtype,
+        )
+        scale_arg = recv_x_scale
+        scale_s0 = recv_x_scale.stride(0)
+        slab_scale_s0 = slab_scale.stride(0)
+    else:
+        sh = 1
+        slab_scale = None
+        scale_arg = recv_x
+        scale_s0 = 0
+        slab_scale_s0 = 0
+    _fwd_kernel_expand_to_masked_slab[(num_local_experts,)](
+        psum_num_recv_tokens_per_expert,
+        recv_x,
+        recv_x.stride(0),
+        scale_arg,
+        scale_s0,
+        slab,
+        slab.stride(0),
+        slab_scale if is_fp8 else scale_arg,
+        slab_scale_s0,
+        masked_m,
+        MAX_M=max_m,
+        ALIGN=expert_alignment,
+        HIDDEN=hidden,
+        HIDDEN_PAD=triton.next_power_of_2(hidden),
+        SCALE_HIDDEN=sh,
+        SCALE_HIDDEN_PAD=triton.next_power_of_2(sh),
+        IS_FP8=is_fp8,
+        num_warps=8,
+    )
+    slab = slab.view(num_local_experts, max_m, hidden)
+    if is_fp8:
+        slab_scale = slab_scale.view(num_local_experts, max_m, sh)
+    return slab, slab_scale, masked_m
+
+
+@triton.jit
+def _fwd_kernel_masked_slab_to_expand(
+    psum_ptr,
+    slab_ptr,
+    slab_stride0,
+    out_ptr,
+    out_stride0,
+    weight_ptr,
+    MAX_M: tl.constexpr,
+    ALIGN: tl.constexpr,
+    HIDDEN: tl.constexpr,
+    HIDDEN_PAD: tl.constexpr,
+    HAS_W: tl.constexpr,
+):
+    e = tl.program_id(0)
+    prev_end = tl.load(psum_ptr + e - 1, mask=e > 0, other=0)
+    start = ((prev_end + ALIGN - 1) // ALIGN) * ALIGN
+    end = tl.load(psum_ptr + e)
+    count = end - start
+    count = tl.minimum(count, MAX_M)
+    off = tl.arange(0, HIDDEN_PAD)
+    mask = off < HIDDEN
+    for j in range(0, count):
+        src = (e * MAX_M + j).to(tl.int64)
+        dst = (start + j).to(tl.int64)
+        v = tl.load(slab_ptr + src * slab_stride0 + off, mask=mask)
+        if HAS_W:
+            w = tl.load(weight_ptr + dst)
+            v = (v.to(tl.float32) * w).to(v.dtype)
+        tl.store(out_ptr + dst * out_stride0 + off, v, mask=mask)
+
+
+@torch.no_grad()
+def masked_slab_to_expand(
+    slab: torch.Tensor,
+    psum_num_recv_tokens_per_expert: torch.Tensor,
+    total_expanded_tokens: int,
+    expert_alignment: int,
+    topk_weights=None,
+):
+    """[E_local, max_m, hidden] masked-GEMM output -> [total, hidden] expanded order.
+
+    Only real rows are written (padding rows stay zeroed). When topk_weights is
+    given ([total_expanded], per expanded row), the top-k weight is fused into the
+    copy so the weighted-combine multiply happens only on real rows (not the
+    worst-case buffer).
+    """
+    num_local_experts, max_m, hidden = slab.shape
+    # combine reads only real rows via handle metadata, so padding need not be
+    # zeroed -> use empty to skip the worst-case-buffer memset.
+    out = torch.empty(
+        (total_expanded_tokens, hidden), device=slab.device, dtype=slab.dtype
+    )
+    slab2d = slab.view(num_local_experts * max_m, hidden)
+    has_w = topk_weights is not None
+    if has_w:
+        weight_arg = topk_weights.reshape(-1).to(torch.float32).contiguous()
+    else:
+        weight_arg = slab2d  # dummy, unused
+    _fwd_kernel_masked_slab_to_expand[(num_local_experts,)](
+        psum_num_recv_tokens_per_expert,
+        slab2d,
+        slab2d.stride(0),
+        out,
+        out.stride(0),
+        weight_arg,
+        MAX_M=max_m,
+        ALIGN=expert_alignment,
+        HIDDEN=hidden,
+        HIDDEN_PAD=triton.next_power_of_2(hidden),
+        HAS_W=has_w,
+        num_warps=8,
+    )
+    return out
