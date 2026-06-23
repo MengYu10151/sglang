@@ -44,7 +44,7 @@ expanded→contiguous / 关 CUDA graph 调查保留在文末「历史 profiling 
 
 - **Decode-like `ISL=1/OSL=1024/CC=128`，CUDA graph 开**：
   - DeepEP low_latency = **~3487 output tok/s**。
-  - EPv2 direct（masked path）= **~3618 output tok/s / 31.47 ms TPOT**，与 DeepEP LL 持平/略快。
+  - EPv2 direct（masked path）**≈ DeepEP LL**，与 LL 的小差距源于 EPv2 比 LL 多一层 repack + 每步 slab 分配（详见「根因与优化历程」），且该差距随 masked slab 尺寸 `max_m = cap × num_ranks` 增长：`cap=512`（decode 节点典型值，cap 对齐 cuda graph decode `max_bs`）时 **~3448 / −1.1%**；`cap=1024`（合并大 prefill 的服务被迫调大）时 **~3252 / −6.7%**。
   - 对照早期关 CUDA graph 的同口径：DeepEP LL ~954、EPv2 direct ~862（expanded contiguous）。CUDA graph 对两者都带来约 3.7x 提升，是 decode 单项最大杠杆。
 - **Prefill-like `ISL=1024/OSL=1/CC=128`**：
   - DeepEP normal（CUDA graph 开）= **~21945 input tok/s**。
@@ -63,14 +63,15 @@ expanded→contiguous / 关 CUDA graph 调查保留在文末「历史 profiling 
    - 权重融合：`masked_slab_to_expand` 只在真实行上乘 top-k 权重，去掉全 buffer 的独立 weight-mul kernel。
    - 回写 buffer 改 `torch.empty`，去掉 zero-fill。
    - 同时 `do_cpu_sync=False` + 静态 `expected_m` 让 direct decode 形状静态、无 host readback，从而可被 CUDA graph capture。
-   - 结果：EPv2 direct 1654 → ~3618，追平并略超 DeepEP LL 3487。
+   - 结果：EPv2 direct 1654 → ~3252（cap=1024）/ ~3448（cap=512），≈ DeepEP LL 3487。残余差距是 EPv2 比 LL 多的 repack + 每步 `[E, max_m, N]` slab 分配（实测 repack kernel 与 max_m 无关、是 count-bounded；只有 masked-GEMM grid 和这些分配随 `max_m = cap × num_ranks` 线性增长，所以差距随 cap 变大）。LL 是 native 持久 masked buffer、无 repack、无每步分配。
 4. **被否决的方向**（避免重蹈）：直接翻 `do_cpu_sync=False` 而不收敛 GEMM 尺寸 → worst-case GEMM 暴涨（830→544）；降 buffer cap → expanded dispatch native dedup assert（cap 不能降）；改 DeepEP native 让 expanded combine 吃权重 → device assert/卡死。L1 单测亦证实 native ElasticBuffer 通信 kernel 本身不比 v1 LL 慢（dispatch 20µs vs 24µs、combine 23µs vs 37µs），瓶颈不在 native kernel。
 
 ### 当前主要风险 / 限制
 
 - direct/hybrid mode 在 server 生命周期内固定，没有 DeepEP v1 `auto` 那种 prefill/decode 自动切换。
 - masked path 只覆盖 `direct + deep_gemm + decode`；direct extend、hybrid、Triton 仍走各自路径。CUDA graph 门控限定在 `direct + deep_gemm + fp8` masked 路径，其它组合（hybrid、`direct + triton/bf16`）由 server_args 自动关闭 graph。
-- masked slab 单 expert 容量 = `max_m`（buffer cap）。若某个 expert 收到的 token 数超过 `max_m`，`expand_to_masked_slab` 会 fail-fast（写 overflow flag、host 在非 graph capture 时检查），不静默截断；graph capture 期间跳过该检查以保持可 capture，由 eager warmup 用代表性 shape 兜底。
+- masked slab 每 expert 容量 `max_m = cap × num_ranks`（`cap = num_max_dispatch_tokens_per_rank`，`num_ranks = ep_group_size`），与 DeepEP LL `[num_local_experts, cap × num_ranks, hidden]` 对齐：一个 local expert 最多从每个 rank 各收 `cap` 个 token，所以这是结构最坏界。**正常 bench 把 `cap` 设成 = cuda graph decode `max_bs` 时，decode per-rank ≤ cap，slab 既贴合 decode、又永不 overflow。** 但 `cap` 同时是 prefill 的 buffer 容量；若服务需要大 prefill 把 `cap` 调到 1024 而 decode `max_bs` 只有 512，slab 会被放大（见性能差距随 cap 增长）。
+- `expand_to_masked_slab` 仍保留 overflow guard（写 flag、host 在非 graph capture 时 fail-fast、不静默截断），但只在 `cap` 配置异常（小于真实 decode batch）时才可能触发；`cap` 设置合理时它是纯防御断言。graph capture 期间跳过该检查以保持可 capture。
 - adapter 只覆盖 DeepGEMM FP8 与 Triton BF16，其它 runner fail-fast。
 - `EpV2Buffer` 是 singleton + 详细 key；多模型/多 group/混合 dtype 切换需改为显式 per-key 生命周期管理。
 - E2E capacity 边界仍需 server 内 instrumentation。
@@ -238,7 +239,10 @@ correctness 先过 `/v1/chat/completions` 三问。
 | Backend | Mode | Output tok/s | Mean TPOT | 状态 |
 | --- | --- | ---: | ---: | --- |
 | DeepEP | low_latency | ~3487 | — | PASS，corrected baseline |
-| EPv2 | direct（masked path） | **~3618** | 31.47 ms | PASS，与 LL 持平/略快 |
+| EPv2 | direct（masked path，cap=512=decode max_bs） | **~3448** | 33.2 ms | PASS，≈ LL（−1.1%） |
+| EPv2 | direct（masked path，cap=1024 > graph max_bs 512） | ~3252 | 35.4 ms | PASS，slab 随 cap 放大（合并大 prefill 的配置） |
+
+每层 MoE transient 分配峰值（`max_memory_allocated`，与 `max_m` 线性）：`max_m` = 1024 / 4096 / 8192 → **388 / 1552 / 3104 MiB**。对应 `cap=512`（max_m=4096）≈1.5GB/层、`cap=1024`（max_m=8192）≈3.1GB/层。该分配被 `mem-fraction-static` 预留池吸收 + 跨层复用，nvidia-smi 峰值（~57.6GB/96GB）无明显增量、不 OOM；显存吃紧的配置下大 cap 的每层 ~3GB transient 需注意。
 
 ### Prefill-like：ISL=1024，OSL=1，CC=128
 
