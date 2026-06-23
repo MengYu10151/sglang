@@ -309,6 +309,14 @@ class _EpV2Impl:
         do_cpu_sync_val = None
         if use_masked:
             do_cpu_sync_val = False
+            # Experiment 1: tighten the per-call dispatch capacity (and thus the
+            # masked slab max_m = num_max_tokens * ep_group_size) to the ACTUAL
+            # decode batch instead of the buffer cap. The buffer cap stays at
+            # num_max_dispatch_tokens_per_rank (prefill-safe). All DP ranks share
+            # the same batch (DP-synced), and under cuda graph _num_input_tokens
+            # is static per captured bs, so the masked shapes stay static. This
+            # shrinks the masked-GEMM grid + per-step allocations for decode.
+            num_max_tokens = self._num_input_tokens
 
         buffer = self._get_buffer()
         self._destroy_handle()
@@ -374,12 +382,12 @@ class _EpV2Impl:
                 )
                 // self.num_experts,
             )
-            # Size the masked slab to the worst case, matching DeepEP LL's
-            # [num_local_experts, cap * num_ranks, hidden] layout: a local expert
-            # can receive up to cap tokens from every rank, so cap * ep_group_size
-            # guarantees a single hot expert can never overflow the slab (the
-            # kernel-level overflow guard then only defends against misconfig).
-            masked_max_m = self.num_max_dispatch_tokens_per_rank * ep_group_size
+            # Experiment 1: size the masked slab to actual-batch * ep_group_size
+            # (= the per-call dispatch num_max_tokens * num_ranks). A local expert
+            # can receive at most (batch) tokens from each rank, so this is still
+            # the true worst case for this decode step; the kernel-level overflow
+            # guard defends against any misconfig.
+            masked_max_m = self._num_input_tokens * ep_group_size
             total_expanded = recv_hidden_states.shape[0]
 
         return EpV2DispatchOutput(
