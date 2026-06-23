@@ -69,7 +69,8 @@ expanded→contiguous / 关 CUDA graph 调查保留在文末「历史 profiling 
 ### 当前主要风险 / 限制
 
 - direct/hybrid mode 在 server 生命周期内固定，没有 DeepEP v1 `auto` 那种 prefill/decode 自动切换。
-- masked path 只覆盖 `direct + deep_gemm + decode`；direct extend、hybrid、Triton 仍走各自路径。CUDA graph 门控只看 `epv2_mode`，`direct + triton` 也会开 graph，但 Triton 是功能路径、未在 graph 下复测，smoke 时建议显式 `--disable-cuda-graph`。
+- masked path 只覆盖 `direct + deep_gemm + decode`；direct extend、hybrid、Triton 仍走各自路径。CUDA graph 门控限定在 `direct + deep_gemm + fp8` masked 路径，其它组合（hybrid、`direct + triton/bf16`）由 server_args 自动关闭 graph。
+- masked slab 单 expert 容量 = `max_m`（buffer cap）。若某个 expert 收到的 token 数超过 `max_m`，`expand_to_masked_slab` 会 fail-fast（写 overflow flag、host 在非 graph capture 时检查），不静默截断；graph capture 期间跳过该检查以保持可 capture，由 eager warmup 用代表性 shape 兜底。
 - adapter 只覆盖 DeepGEMM FP8 与 Triton BF16，其它 runner fail-fast。
 - `EpV2Buffer` 是 singleton + 详细 key；多模型/多 group/混合 dtype 切换需改为显式 per-key 生命周期管理。
 - E2E capacity 边界仍需 server 内 instrumentation。
@@ -77,7 +78,7 @@ expanded→contiguous / 关 CUDA graph 调查保留在文末「历史 profiling 
 ### 下一步优先级
 
 1. 固化 correctness/unit test：masked slab repack（`expand_to_masked_slab`/`masked_slab_to_expand`）的 round-trip 与 top-k 权重融合、empty-token rank、expanded local expert id contract、capacity guard。
-2. CUDA graph 覆盖面：确认 `direct + triton` 在 graph 下的安全性；评估 hybrid 是否可改造成 capturable。
+2. CUDA graph 覆盖面：`direct + triton/bf16` 与 hybrid 目前自动关 graph；若要扩面需先在 graph 下复测对应路径，并评估 hybrid 是否可改造成 capturable。
 3. E2E dispatcher instrumentation：记录真实进入 dispatch 的 token/count/capacity。
 4. TBO/SBO overlap hooks（较大工作量，目前 server 启动阶段直接拒绝）。
 5. 与 DeepEP v2 native 对齐更省的接口（masked-compatible dispatch output、weighted expanded combine、减少 handle/count 生命周期开销）——可进一步缩小残余开销，但当前 decode 已达 parity，优先级降低。
@@ -148,8 +149,9 @@ CUDA graph 支持：
 
 | 路径 | CUDA graph | 说明 |
 | --- | --- | --- |
-| EPv2 direct（decode，deep_gemm） | 支持 | masked path 形状静态、无 host readback，可 capture。server_args 默认开启。 |
-| EPv2 hybrid | 不支持 | non-expanded cpu_sync 路径 capture 时 `cudaErrorStreamCaptureUnjoined`；server_args 按 `epv2_mode!="direct"` 自动关闭。 |
+| EPv2 direct（decode，deep_gemm + fp8） | 支持 | masked path 形状静态、无 host readback，可 capture。server_args 只对这一组合默认开启。 |
+| EPv2 hybrid | 不支持 | non-expanded cpu_sync 路径 capture 时 `cudaErrorStreamCaptureUnjoined`；server_args 自动关闭。 |
+| EPv2 direct + triton/bf16 | 不支持 | 非 masked 路径，server_args 自动关闭 graph。 |
 | DeepEP normal / low_latency | 支持 | 基线对照，均可 capture。 |
 
 ## 代码结构
