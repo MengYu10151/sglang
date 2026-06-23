@@ -3802,11 +3802,21 @@ class ServerArgs:
                 )
             self.ep_size = self.tp_size
             self.disable_shared_experts_fusion = True
-            # CUDA graph: EPv2 direct-mode decode is capturable (masked GEMM, static
-            # shapes, no host readback). Hybrid mode uses the non-expanded cpu_sync
-            # path which is NOT capturable (cudaErrorStreamCaptureUnjoined), so keep
-            # cuda graph disabled there. (Prefill/extend runs eager either way.)
-            if self.epv2_mode != "direct":
+            # CUDA graph is only safe on the EPv2 direct-mode decode masked-GEMM
+            # path: deep_gemm runner + fp8 dispatch gives static shapes and no host
+            # readback. Every other EPv2 combination (hybrid, or direct + triton/
+            # bf16) falls back to a non-capturable path (host readback / cpu_sync ->
+            # cudaErrorStreamCaptureUnjoined), so disable cuda graph there.
+            epv2_fp8 = self.epv2_dispatcher_output_dtype == "fp8" or (
+                self.epv2_dispatcher_output_dtype == "auto"
+                and self.moe_runner_backend == "deep_gemm"
+            )
+            epv2_graph_ok = (
+                self.epv2_mode == "direct"
+                and self.moe_runner_backend == "deep_gemm"
+                and epv2_fp8
+            )
+            if not epv2_graph_ok:
                 self.cuda_graph_config.decode.backend = Backend.DISABLED
                 self.cuda_graph_config.prefill.backend = Backend.DISABLED
             logger.warning(
@@ -3815,8 +3825,9 @@ class ServerArgs:
             logger.warning(
                 "DeepEP v2 MoE is using epv2_mode=%s. This controls "
                 "ElasticBuffer direct/hybrid mode and is independent from "
-                "--deepep-mode normal/low_latency. DeepEP v2 MoE currently "
-                "disables cuda graph and shared expert fusion. "
+                "--deepep-mode normal/low_latency. DeepEP v2 MoE enables cuda "
+                "graph only on the direct + deep_gemm + fp8 masked decode path "
+                "and disables shared expert fusion. "
                 "SGLANG_EPV2_NUM_MAX_DISPATCH_TOKENS_PER_RANK is a "
                 "per-rank communication buffer capacity, not a model limit; "
                 "increase it for large prefill/chunked-prefill workloads.",

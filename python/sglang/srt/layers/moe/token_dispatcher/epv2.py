@@ -360,9 +360,18 @@ class _EpV2Impl:
         masked_max_m = 0
         total_expanded = 0
         if use_masked:
+            # Align expected_m with DeepEP LL (deepep.py dispatch_a): it is the
+            # average tokens-per-expert across the whole EP group, so the global
+            # token count (local tokens * EP group size) must be used, not just
+            # the local token count. group size == ep world size ==
+            # num_experts // num_local_experts.
+            ep_group_size = max(1, self.num_experts // self.num_local_experts)
             expected_m = max(
                 1,
-                (self._num_input_tokens * self.router_topk + self.num_experts)
+                (
+                    self._num_input_tokens * ep_group_size * self.router_topk
+                    + self.num_experts
+                )
                 // self.num_experts,
             )
             masked_max_m = self.num_max_dispatch_tokens_per_rank

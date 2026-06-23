@@ -1835,7 +1835,12 @@ def init_distributed_environment(
                     init_local_rank = int(os.environ.get("LOCAL_RANK", "0"))
                 else:
                     init_local_rank = rank
-            if init_local_rank >= 0:
+            # On multi-node runs the global rank can exceed the per-node GPU
+            # count, so wrap it into the local device range before using it as
+            # the cuda device id passed to NCCL.
+            device_count = torch.cuda.device_count()
+            if init_local_rank >= 0 and device_count > 0:
+                init_local_rank = init_local_rank % device_count
                 init_process_group_kwargs["device_id"] = torch.device(
                     f"cuda:{init_local_rank}"
                 )

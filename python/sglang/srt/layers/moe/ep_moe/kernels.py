@@ -1749,6 +1749,7 @@ def _fwd_kernel_expand_to_masked_slab(
     slab_scale_ptr,
     slab_scale_stride0,
     masked_m_ptr,
+    overflow_ptr,
     MAX_M: tl.constexpr,
     ALIGN: tl.constexpr,
     HIDDEN: tl.constexpr,
@@ -1761,9 +1762,13 @@ def _fwd_kernel_expand_to_masked_slab(
     prev_end = tl.load(psum_ptr + e - 1, mask=e > 0, other=0)
     start = ((prev_end + ALIGN - 1) // ALIGN) * ALIGN
     end = tl.load(psum_ptr + e)
-    count = end - start
-    count = tl.minimum(count, MAX_M)
+    raw_count = end - start
+    count = tl.minimum(raw_count, MAX_M)
     tl.store(masked_m_ptr + e, count)
+    # Flag (instead of silently truncating) when an expert receives more tokens
+    # than the masked slab can hold. The host reads this outside graph capture.
+    ovf = tl.arange(0, 1)
+    tl.store(overflow_ptr + ovf, 1, mask=raw_count > MAX_M)
 
     off = tl.arange(0, HIDDEN_PAD)
     mask = off < HIDDEN
@@ -1801,6 +1806,7 @@ def expand_to_masked_slab(
     masked_m = torch.empty(
         (num_local_experts,), device=recv_x.device, dtype=torch.int32
     )
+    overflow = torch.zeros((1,), device=recv_x.device, dtype=torch.int32)
     if is_fp8:
         sh = recv_x_scale.shape[1]
         slab_scale = torch.empty(
@@ -1828,6 +1834,7 @@ def expand_to_masked_slab(
         slab_scale if is_fp8 else scale_arg,
         slab_scale_s0,
         masked_m,
+        overflow,
         MAX_M=max_m,
         ALIGN=expert_alignment,
         HIDDEN=hidden,
@@ -1837,6 +1844,15 @@ def expand_to_masked_slab(
         IS_FP8=is_fp8,
         num_warps=8,
     )
+    # Outside cuda graph capture, fail fast on slab overflow rather than return a
+    # silently truncated result. During capture we skip the host read to keep the
+    # path graph-safe; the eager warmup forward validates representative shapes.
+    if not torch.cuda.is_current_stream_capturing() and int(overflow.item()) != 0:
+        raise RuntimeError(
+            f"EPv2 masked slab overflow: an expert received more than max_m="
+            f"{max_m} tokens; increase "
+            f"SGLANG_EPV2_NUM_MAX_DISPATCH_TOKENS_PER_RANK."
+        )
     slab = slab.view(num_local_experts, max_m, hidden)
     if is_fp8:
         slab_scale = slab_scale.view(num_local_experts, max_m, sh)
