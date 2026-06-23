@@ -374,7 +374,12 @@ class _EpV2Impl:
                 )
                 // self.num_experts,
             )
-            masked_max_m = self.num_max_dispatch_tokens_per_rank
+            # Size the masked slab to the worst case, matching DeepEP LL's
+            # [num_local_experts, cap * num_ranks, hidden] layout: a local expert
+            # can receive up to cap tokens from every rank, so cap * ep_group_size
+            # guarantees a single hot expert can never overflow the slab (the
+            # kernel-level overflow guard then only defends against misconfig).
+            masked_max_m = self.num_max_dispatch_tokens_per_rank * ep_group_size
             total_expanded = recv_hidden_states.shape[0]
 
         return EpV2DispatchOutput(
