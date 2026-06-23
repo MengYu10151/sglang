@@ -44,7 +44,7 @@ expanded→contiguous / 关 CUDA graph 调查保留在文末「历史 profiling 
 
 - **Decode-like `ISL=1/OSL=1024/CC=128`，CUDA graph 开**：
   - DeepEP low_latency = **~3487 output tok/s**。
-  - EPv2 direct（masked path）**≈ DeepEP LL**，与 LL 的小差距源于 EPv2 比 LL 多一层 repack + 每步 slab 分配（详见「根因与优化历程」），且该差距随 masked slab 尺寸 `max_m = cap × num_ranks` 增长：`cap=512`（decode 节点典型值，cap 对齐 cuda graph decode `max_bs`）时 **~3448 / −1.1%**；`cap=1024`（合并大 prefill 的服务被迫调大）时 **~3252 / −6.7%**。
+  - EPv2 direct（masked path）**≈ DeepEP LL**，与 LL 的小差距源于 EPv2 比 LL 多一层 repack + 每步 slab 分配（详见「根因与优化历程」），且该差距随 masked slab 尺寸 `max_m = cap × num_ranks` 增长：`cap=512`（decode 节点典型值，cap 对齐 cuda graph decode `max_bs`）时基本与 LL 持平；`cap=1024`（合并大 prefill 的服务被迫调大）时 **~3376 / −3.2%**（mn-major scale 优化后，见下）。
   - 对照早期关 CUDA graph 的同口径：DeepEP LL ~954、EPv2 direct ~862（expanded contiguous）。CUDA graph 对两者都带来约 3.7x 提升，是 decode 单项最大杠杆。
 - **Prefill-like `ISL=1024/OSL=1/CC=128`**：
   - DeepEP normal（CUDA graph 开）= **~21945 input tok/s**。
@@ -64,6 +64,7 @@ expanded→contiguous / 关 CUDA graph 调查保留在文末「历史 profiling 
    - 回写 buffer 改 `torch.empty`，去掉 zero-fill。
    - 同时 `do_cpu_sync=False` + 静态 `expected_m` 让 direct decode 形状静态、无 host readback，从而可被 CUDA graph capture。
    - 结果：EPv2 direct 1654 → ~3252（cap=1024）/ ~3448（cap=512），≈ DeepEP LL 3487。残余差距是 EPv2 比 LL 多的 repack + 每步 `[E, max_m, N]` slab 分配（实测 repack kernel 与 max_m 无关、是 count-bounded；只有 masked-GEMM grid 和这些分配随 `max_m = cap × num_ranks` 线性增长，所以差距随 cap 变大）。LL 是 native 持久 masked buffer、无 repack、无每步分配。
+4. **torch-profiler timeline 归因 + mn-major scale 优化（cap=1024：3252 → 3376，−6.7% → −3.2%）**：抓稳态单层 decode（cuda graph，bs=16/rank）的 GPU timeline 发现——计算 stream busy 628/640µs、idle 仅 11µs（kernel 背靠背，**不是** spin-wait 主导；通信只占 ~5%）。逐 kernel diff EPv2 vs LL，EPv2 每层多出三项 LL 没有的开销：`expand_to_masked_slab`（~9.5µs）、**GEMM0 前的 scale 转置 `transpose_fp32`（~28.9µs，最大单项）**、`masked_slab_to_expand`（~11.7µs），合计 ~50µs/层 ≈ step 的 7.8%，正好对上 gap。其中 scale 转置可消除：原先 masked path 用 row-major scale，DeepGEMM 侧每层调 `get_mn_major_tma_aligned_tensor` 转成 mn-major TMA-aligned；改为让 `expand_to_masked_slab` 直接产出 mn-major 布局（物理 `[E, sh, max_m]` contiguous、view 成 `[E, max_m, sh]`），该转置变零拷贝 no-op。实测 cap=1024 下 decode **3252 → 3376（+3.8%）**，gap 收窄到 −3.2%。该函数仍兜底转置，correctness 不依赖此优化。
 4. **被否决的方向**（避免重蹈）：直接翻 `do_cpu_sync=False` 而不收敛 GEMM 尺寸 → worst-case GEMM 暴涨（830→544）；降 buffer cap → expanded dispatch native dedup assert（cap 不能降）；改 DeepEP native 让 expanded combine 吃权重 → device assert/卡死。L1 单测亦证实 native ElasticBuffer 通信 kernel 本身不比 v1 LL 慢（dispatch 20µs vs 24µs、combine 23µs vs 37µs），瓶颈不在 native kernel。
 
 ### 当前主要风险 / 限制
@@ -239,8 +240,9 @@ correctness 先过 `/v1/chat/completions` 三问。
 | Backend | Mode | Output tok/s | Mean TPOT | 状态 |
 | --- | --- | ---: | ---: | --- |
 | DeepEP | low_latency | ~3487 | — | PASS，corrected baseline |
-| EPv2 | direct（masked path，cap=512=decode max_bs） | **~3448** | 33.2 ms | PASS，≈ LL（−1.1%） |
-| EPv2 | direct（masked path，cap=1024 > graph max_bs 512） | ~3252 | 35.4 ms | PASS，slab 随 cap 放大（合并大 prefill 的配置） |
+| EPv2 | direct（masked path，cap=512=decode max_bs） | **~3448** | 33.2 ms | PASS，≈ LL |
+| EPv2 | direct（masked path，cap=1024，mn-major scale） | **~3376** | 34.0 ms | PASS，−3.2%（scale 转置消除后） |
+| EPv2 | direct（masked path，cap=1024，优化前 row-major scale） | ~3252 | 35.4 ms | 历史，每层多 ~28.9µs scale 转置 |
 
 每层 MoE transient 分配峰值（`max_memory_allocated`，与 `max_m` 线性）：`max_m` = 1024 / 4096 / 8192 → **388 / 1552 / 3104 MiB**。对应 `cap=512`（max_m=4096）≈1.5GB/层、`cap=1024`（max_m=8192）≈3.1GB/层。该分配被 `mem-fraction-static` 预留池吸收 + 跨层复用，nvidia-smi 峰值（~57.6GB/96GB）无明显增量、不 OOM；显存吃紧的配置下大 cap 的每层 ~3GB transient 需注意。
 
