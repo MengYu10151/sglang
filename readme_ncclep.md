@@ -1,332 +1,400 @@
-# SGLang NCCL_EP Integration README
+# SGLang NCCL_EP Integration Guide
 
-本文档总结当前 SGLang 中 NCCL_EP 的模型适配、runner 适配、部署方式和已知限制。
+本文档记录当前 NCCL_EP/Nico EP 在 SGLang 中的可运行部署方式、验证方法和已经完成的主要优化。
 
-## 当前结论
+当前目标不是覆盖所有模型和所有 backend，而是明确一条已经验证过的 SM120 路径：
 
-- NCCL_EP 作为独立 MoE A2A backend 使用：`--moe-a2a-backend ncclep`。
-- NCCL_EP mode 使用独立参数：`--ncclep-mode high_throughput | low_latency`，不要复用 `--deepep-mode`。
-- HT/high_throughput 面向 prefill / large-token 场景。
-- LL/low_latency 面向 decode / small-token 场景。
-- dispatcher output dtype 使用：`--ncclep-dispatcher-output-dtype auto | bf16 | fp8`。
-- 部署目标是不依赖已有 `/root/menyu/nccl` 本地源码树。可以在干净容器中直接 clone 最新 NCCL 源码、编译 NCCL + NCCL_EP、安装 `nccl4py`，然后运行 SGLang。
+- SGLang fork + NCCL_EP 独立 MoE A2A backend。
+- 自编译 NCCL/NCCL_EP。
+- SM120 上需要应用 NCCL_EP low-latency patch。
+- DeepSeek-V4-Flash + DeepGEMM + NCCL_EP low_latency 可运行并通过 correctness。
 
-## 模型适配
+## 1. Deploy Guide
 
-NCCL_EP 只替换 MoE expert-parallel 的 dispatch/combine 通信，不替换 attention、router、MLP kernel、scheduler 或 KV cache。一个模型要能接入 NCCL_EP，需要同时满足：
+### 1.1 Validated Environment
 
-1. 模型 MoE forward 能进入 SGLang 的 EP MoE 路径。
-2. MoE runner 有对应的 NCCL_EP pre/post adapter。
-3. dispatcher 输出的 dtype/layout 与 runner 输入契约匹配。
-4. 模型 forward 中如果有 post-expert TP all-reduce、shared expert、empty-token rank 等特殊逻辑，需要与 NCCL_EP 的 empty rank 行为对齐。
+当前验证环境：
 
-### 已验证模型矩阵
+| Item | Value |
+|---|---|
+| Host | 5k11, `10.6.142.11`, no-NVL 8 GPU SM120 machine |
+| Workdir | `/root/menyu` |
+| Docker | `5k11_ncclep_qwen` |
+| SGLang repo | `/root/menyu/sglang` |
+| SGLang branch | `ncclep-dsv4-sm120-deepgemm-opt` |
+| Last validated commit | `d57063e17 Clean up NCCL EP DSV4 integration` |
+| NCCL lib | `/root/menyu/nccl/build/lib/libnccl.so.2.30.7` |
+| NCCL_EP lib | `/root/menyu/nccl/build/lib/libnccl_ep.so.0.0.1` |
+| Python | `3.12.3` |
+| PyTorch | `2.11.0+cu130` |
+| DeepGEMM | `2.5.0` |
+| DSV4 model | `/root/menyu/models/DeepSeek-V4-Flash` |
 
-| Model | Hardware / topology | Runner | NCCL_EP mode | Dtype | 当前状态 | 备注 |
-|---|---|---|---|---|---|---|
-| DeepSeek-V4-Flash-FP8 / DSv4 Flash | H20 8 GPU / NVL | DeepGEMM | HT | FP8 | 可运行 | 推荐用于 prefill-like / large-token 验证；HT 与 DeepEP normal 仍有性能差距。 |
-| DeepSeek-V4-Flash-FP8 / DSv4 Flash | H20 8 GPU / NVL | DeepGEMM | LL | FP8 | 可运行 | 推荐只用于 decode-like / small-token 验证；不要用 LL 代表 prefill 性能。 |
-| DeepSeek-V4-Flash-FP8 / DSv4 Flash | H20 8 GPU / NVL | Triton | HT/LL | BF16 | 可运行 | 适合作为 BF16 通信正确性路径；不是 DSv4 FP8 性能主线。 |
-| Mixtral-8x7B-Instruct-v0.1-FP8 | 8 GPU | Triton / patch-based repro | HT/LL | BF16/FP8 smoke | 可运行 | 已复现多卡 `/generate`；EP8 下每 rank 只有 1 个 expert，必须处理 empty-token rank。 |
-| Qwen3.5-35B-A3B / Qwen3.5-35B-A3B-FP8 | 5k11 no-NVL / SM120 | Triton / Marlin fallback | LL | BF16 | 功能可跑，性能不佳 | no-NVL 下推荐 `NCCL_LSA_TEAM_SIZE=1`；HT 在 no-NVL 上未作为通过路径。 |
-| Qwen3.5-35B-A3B-FP8 | 5k11 no-NVL / SM120 | DeepGEMM | HT/LL | FP8 | 不适用 | 当前 latest SGLang 在 SM120 上默认禁用 DeepGEMM，不能作为合法验证路径。 |
-| 其他 MoE 模型 | 未验证 | 未验证 | 未验证 | 未验证 | 不保证 | 需要先确认模型 forward、runner adapter、dtype/layout。 |
+The important point is that SGLang does not use a system NCCL_EP package. Runtime must load the locally built NCCL/NCCL_EP pair and the matching `nccl4py` binding.
 
-### 模型适配注意点
+### 1.2 SGLang Fork
 
-- DSv4 Flash FP8 的主线是 `DeepGEMM + FP8 activation + activation scale`。
-- Triton runner 需要 BF16 activation，不消费 FP8 activation scale。
-- Qwen2-MoE / Qwen3.5 路径需要显式让 `is_ncclep()` 进入 A2A MoE forward 语义；模型层共享 `forward_a2a_moe` 的 router/topk/shared-expert 流程，通信 backend 仍在 dispatcher 层独立选择 `NcclEpDispatcher`，不能落回普通 TP MoE 路径。
-- no-NVL 拓扑下，LL 可以通过 `NCCL_LSA_TEAM_SIZE=1` 规避部分 HT/LSA/NVL 假设，但性能和稳定性仍需单独验证。
-- PD disaggregation 的语义应保持：P 节点用 HT，D 节点用 LL。PD 会混入 NIXL/router/KV transfer，不适合作为 NCCL_EP dispatcher 的第一验证入口。
-
-## MoE Runner 适配矩阵
-
-| MoE runner | HT BF16 | HT FP8 | LL BF16 | LL FP8 | 当前结论 |
-|---|---|---|---|---|---|
-| `triton` | 可以 | 不建议 | 可以 | 不建议 | BF16 activation 路径可运行。 |
-| `deep_gemm` | 不建议 | 可以 | 不建议 | 可以 | FP8 activation + scale 路径可运行，是 DSv4 Flash FP8 主线。 |
-| `marlin` | 未作为主线 | 不适用 | 可以 | 不适用 | 5k11/DSv4 fallback 可跑，但性能差，只能算功能性路径。 |
-| `triton_kernel` | 不可以 | 不可以 | 不可以 | 不可以 | DSv4 Flash FP8 权重/layout 不匹配。 |
-| `flashinfer_trtllm` | 不可以 | 不可以 | 不可以 | 不可以 | 缺少 `ncclep` fused func。 |
-| `flashinfer_trtllm_routed` | 不可以 | 不可以 | 不可以 | 不可以 | 同上。 |
-| `flashinfer_cutlass` | 不可以 | 不可以 | 不可以 | 不可以 | 当前量化路径未创建 runner，也没有 NCCL_EP adapter。 |
-| `flashinfer_mxfp4` | 不可以 | 不可以 | 不可以 | 不可以 | 当前 DSv4 Flash 测试走 FP8，不是 MXFP4 runner 路径。 |
-| `flashinfer_cutedsl` | 不可以 | 不可以 | 不可以 | 不可以 | 只支持特定 FP4/modelopt 路径，且缺少 NCCL_EP fused func。 |
-| `cutlass` | 不可以 | 不可以 | 不可以 | 不可以 | runner 配置断言失败。 |
-| `aiter` | 不可以 | 不可以 | 不可以 | 不可以 | `Fp8MoEMethod` 没有 AITER 分支。 |
-
-## 部署方式
-
-### 推荐方式：干净环境直接下载并编译 NCCL/NCCL_EP
-
-当前已有脚本 `scripts/build_nccl_ep.sh`，设计目标就是在新容器内自包含地准备 NCCL_EP，不依赖 host 上已有的 `/root/menyu/nccl`。
-
-典型流程：
+Use our SGLang fork and the NCCL_EP integration branch:
 
 ```bash
-# 在带 nvcc/git/make/python/pip 的 SGLang dev 容器中
-cd /workspace/sglang
-
-# 从 NVIDIA/nccl 拉取并编译最新 NCCL + NCCL_EP
-WORKDIR=/opt/ncclep \
-NCCL_REF=master \
-CUDA_ARCH=90 \
-BUILD_JOBS=24 \
-bash scripts/build_nccl_ep.sh
-
-# 运行 SGLang 前加载环境
-source /opt/ncclep/ncclep_env.sh
+cd /root/menyu
+git clone https://github.com/MengYu10151/sglang.git
+cd /root/menyu/sglang
+git checkout ncclep-dsv4-sm120-deepgemm-opt
 ```
 
-如果要固定 release/tag/commit：
+Install SGLang in the dev container:
 
 ```bash
-WORKDIR=/opt/ncclep \
-NCCL_REF=v2.30.7-1 \
-CUDA_ARCH=90 \
-bash scripts/build_nccl_ep.sh
+cd /root/menyu/sglang
+pip install -e python
 ```
 
-如果是 SM120 / 5k11：
+For DSV4 Flash + DeepGEMM on SM120, the current branch contains the needed SGLang-side changes:
 
-```bash
-WORKDIR=/opt/ncclep \
-NCCL_REF=master \
-CUDA_ARCH=120 \
-bash scripts/build_nccl_ep.sh
+- `--moe-a2a-backend ncclep`
+- `--ncclep-mode high_throughput | low_latency`
+- `--ncclep-dispatcher-output-dtype bf16 | fp8`
+- `--ncclep-config <json>`
+- SM120 DeepGEMM wrapper changes for DSV4 FP8/FP4 expert path
+- NCCL_EP event-based sync and handle lifetime management
+
+### 1.3 NCCL/NCCL_EP for SM120
+
+SM120 needs an NCCL_EP patch before building low_latency. Use the public patch and guide here:
+
+```text
+https://github.com/qijiaxing/nccl/tree/v2.30u1-sm120/contrib/nccl_ep/sm120
 ```
 
-脚本会完成：
+That guide provides:
 
-- clone 或复用 NCCL source。
-- 编译 NCCL base library。
-- 编译 `contrib/nccl_ep`。
-- 将 `libnccl_ep.so`、`libnccl.so.2`、headers staging 到 `bindings/nccl4py/nccl/ep`。
-- `pip install -e <nccl>/bindings/nccl4py`。
-- 生成 `${WORKDIR}/ncclep_env.sh`。
+- `contrib/nccl_ep/sm120/nccl_ep_sm120_ll_low_latency.patch`
+- build instructions for `sm_120`
+- an `ep_bench` validation command
 
-生成的环境变量包括：
+The patch reduces NCCL_EP low_latency kernel shared-memory pressure for RTX 5k/6kD style SM120 GPUs. Do not use an unpatched NCCL_EP low_latency build on SM120 for this integration test.
+
+Public-source flow:
 
 ```bash
-export NCCL_HOME=<nccl>/build
-export LD_LIBRARY_PATH=<nccl>/build/lib:${LD_LIBRARY_PATH}
-export LD_PRELOAD=<nccl>/build/lib/libnccl.so.2:${LD_PRELOAD}
-export PYTHONPATH=<nccl>/bindings/nccl4py:${PYTHONPATH}
-export SGLANG_NCCL_EP_SO_PATH=<nccl>/build/lib/libnccl_ep.so
-export NCCL_EP_JIT_BUILD_INCLUDE_DIR=<nccl>/build/include
-export NCCL_EP_JIT_SOURCE_DIR=<nccl>/bindings/nccl4py/nccl/ep/include
+cd /root/menyu
+git clone https://github.com/qijiaxing/nccl.git
+cd /root/menyu/nccl
+git checkout v2.30u1-sm120
+
+git apply contrib/nccl_ep/sm120/nccl_ep_sm120_ll_low_latency.patch
+
+export NVCC_GENCODE="-gencode=arch=compute_120,code=sm_120"
+export CUDA_HOME=/usr/local/cuda
+export MPI_HOME=/usr/mpi/gcc/openmpi-4.1.9a1
+
+make -C . src.build BUILDDIR=$PWD/build -j
+make -C contrib/nccl_ep lib ep_bench MPI=1 BUILDDIR=$PWD/build -j
+pip install -e bindings/nccl4py
+```
+
+Current internal environment uses an equivalent locally patched tree at:
+
+```text
+/root/menyu/nccl
+```
+
+### 1.4 Runtime Environment Variables
+
+Load the matching NCCL/NCCL_EP pair before launching SGLang:
+
+```bash
+source /root/menyu/ncclep_build/ncclep_env.sh
+```
+
+Current `ncclep_env.sh`:
+
+```bash
+export NCCL_HOME="/root/menyu/nccl/build"
+export LD_LIBRARY_PATH="/root/menyu/nccl/build/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+export LD_PRELOAD="/root/menyu/nccl/build/lib/libnccl.so.2${LD_PRELOAD:+:${LD_PRELOAD}}"
+export PYTHONPATH="/root/menyu/nccl/bindings/nccl4py${PYTHONPATH:+:${PYTHONPATH}}"
+export SGLANG_NCCL_EP_SO_PATH="/root/menyu/nccl/build/lib/libnccl_ep.so"
+export NCCL_EP_JIT_BUILD_INCLUDE_DIR="/root/menyu/nccl/build/include"
+export NCCL_EP_JIT_SOURCE_DIR="/root/menyu/nccl/bindings/nccl4py/nccl/ep/include"
 export NCCL_CUMEM_ENABLE=1
 export NCCL_WIN_ENABLE=1
 ```
 
-结论：部署上可以不再依赖本地固定 repo。只要 NCCL upstream API 与 SGLang adapter 当前绑定兼容，就可以直接下载最新 NCCL 编译使用。若 upstream API 变化，需要同步更新 Python binding / adapter 并重新跑 correctness。
-
-### Debug 方式：复用已有 NCCL 源码树
-
-如果要复用已有 dirty NCCL 源码树，避免脚本 checkout 覆盖：
+For 5k11 no-NVL runs, also use:
 
 ```bash
-WORKDIR=/opt/ncclep \
-NCCL_SRC=/root/menyu/nccl \
-NCCL_REF=local \
-CUDA_ARCH=90 \
-bash scripts/build_nccl_ep.sh
-
-source /opt/ncclep/ncclep_env.sh
-```
-
-这种方式只建议用于调试 NCCL_EP native patch，不建议作为可复现部署文档的默认路径。
-
-### 一键干净容器 bootstrap
-
-`scripts/bootstrap_clean_ncclep_container.sh` 进一步封装了：
-
-1. 编译 NCCL/NCCL_EP。
-2. clone `MengYu10151/sglang` 的 `ncclep-integration` 分支。
-3. editable install SGLang。
-4. import check。
-5. 跑 NCCL_EP boundary cases。
-
-示例：
-
-```bash
-WORKDIR=/opt/ncclep \
-NCCL_REF=master \
-CUDA_ARCH=90 \
-bash scripts/bootstrap_clean_ncclep_container.sh
-```
-
-这个脚本适合验证“新机器从零准备是否可运行”。
-
-## SGLang 启动模板
-
-### DSv4 Flash + DeepGEMM + HT
-
-```bash
-source /opt/ncclep/ncclep_env.sh
-
-export SGLANG_NCCL_EP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=8192
-
-python -m sglang.launch_server \
-  --model-path /models/DeepSeek-V4-Flash-FP8 \
-  --trust-remote-code \
-  --tp-size 8 \
-  --ep-size 8 \
-  --moe-a2a-backend ncclep \
-  --ncclep-mode high_throughput \
-  --ncclep-dispatcher-output-dtype fp8 \
-  --moe-runner-backend deep_gemm \
-  --kv-cache-dtype fp8_e4m3 \
-  --disable-cuda-graph
-```
-
-### DSv4 Flash + DeepGEMM + LL
-
-```bash
-source /opt/ncclep/ncclep_env.sh
-
-export SGLANG_NCCL_EP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128
-
-python -m sglang.launch_server \
-  --model-path /models/DeepSeek-V4-Flash-FP8 \
-  --trust-remote-code \
-  --tp-size 8 \
-  --ep-size 8 \
-  --moe-a2a-backend ncclep \
-  --ncclep-mode low_latency \
-  --ncclep-dispatcher-output-dtype fp8 \
-  --moe-runner-backend deep_gemm \
-  --kv-cache-dtype fp8_e4m3 \
-  --disable-cuda-graph
-```
-
-### Triton BF16 runner
-
-```bash
-source /opt/ncclep/ncclep_env.sh
-
-python -m sglang.launch_server \
-  --model-path <model> \
-  --trust-remote-code \
-  --tp-size 8 \
-  --ep-size 8 \
-  --moe-a2a-backend ncclep \
-  --ncclep-mode high_throughput \
-  --ncclep-dispatcher-output-dtype bf16 \
-  --moe-runner-backend triton \
-  --disable-cuda-graph
-```
-
-### no-NVL / 5k11 LL
-
-```bash
-source /opt/ncclep/ncclep_env.sh
-
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1
+export SGLANG_ENABLE_JIT_DEEPGEMM=1
+export SGLANG_DSV4_FP4_EXPERTS=1
+export SGLANG_OPT_USE_JIT_EP_ACTIVATION=true
+export SGLANG_NCCL_EP_SYNC_MODE=event
+export SGLANG_NCCL_EP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256
 export NCCL_LSA_TEAM_SIZE=1
 export NCCL_NET_MERGE_LEVEL=LOC
+export NCCL_CUMEM_ENABLE=1
+export NCCL_WIN_ENABLE=1
 export NCCL_NVLS_ENABLE=0
-export SGLANG_NCCL_EP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024
-
-python -m sglang.launch_server \
-  --model-path /root/menyu/models/Qwen3.5-35B-A3B-FP8 \
-  --trust-remote-code \
-  --dp-size 4 \
-  --ep-size 4 \
-  --enable-dp-attention \
-  --moe-a2a-backend ncclep \
-  --ncclep-mode low_latency \
-  --ncclep-dispatcher-output-dtype bf16 \
-  --moe-runner-backend triton \
-  --disable-cuda-graph
+export NCCL_EP_TIMEOUT_MS=10000
 ```
 
-## 验证顺序
+### 1.5 Import Check
 
-推荐按下面顺序验证，避免一上来用真实 serving 混入模型、runner、scheduler、KV、router 等变量。
-
-1. Import check：
+Run this before starting SGLang:
 
 ```bash
-source /opt/ncclep/ncclep_env.sh
-python - <<'PY'
+source /root/menyu/ncclep_build/ncclep_env.sh
+cd /root/menyu/sglang/python
+
+python3 - <<'PY'
 import os
+import torch
 import nccl
 import nccl.ep
+
+print("torch =", torch.__version__)
 print("nccl =", nccl.__file__)
 print("nccl.ep =", nccl.ep.__file__)
 print("SGLANG_NCCL_EP_SO_PATH =", os.environ.get("SGLANG_NCCL_EP_SO_PATH"))
 PY
 ```
 
-2. Native NCCL_EP benchmark：
+### 1.6 DSV4 + NCCL_EP LL Launch Template
+
+This is the validated SM120 DSV4 server shape:
 
 ```bash
-# 示例，具体 binary 路径以 NCCL build 输出为准
-<nccl>/build/test/nccl_ep/ep_bench \
-  --algorithm ht \
-  --hidden 4096 \
-  --top-k 6 \
-  --experts 256 \
-  --tokens 8192 \
-  --validate
+source /root/menyu/ncclep_build/ncclep_env.sh
 
-<nccl>/build/test/nccl_ep/ep_bench \
+export PYTHONPATH="/root/menyu/sglang/python:${PYTHONPATH:-}"
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1
+export SGLANG_ENABLE_JIT_DEEPGEMM=1
+export SGLANG_DSV4_FP4_EXPERTS=1
+export SGLANG_OPT_USE_JIT_EP_ACTIVATION=true
+export SGLANG_OPT_SWIGLU_CLAMP_FUSION=true
+export SGLANG_NCCL_EP_SYNC_MODE=event
+export SGLANG_NCCL_EP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256
+export NCCL_LSA_TEAM_SIZE=1
+export NCCL_NET_MERGE_LEVEL=LOC
+export NCCL_NVLS_ENABLE=0
+
+cat >/tmp/ncclep_ll_sm32.json <<'JSON'
+{"low_latency":{"num_sms":32,"layout":"expert_major"}}
+JSON
+
+python3 -m sglang.launch_server \
+  --model-path /root/menyu/models/DeepSeek-V4-Flash \
+  --trust-remote-code \
+  --host 127.0.0.1 \
+  --port 32123 \
+  --context-length 16384 \
+  --kv-cache-dtype fp8_e4m3 \
+  --mem-fraction-static 0.8 \
+  --tp-size 8 \
+  --dp-size 8 \
+  --ep-size 8 \
+  --enable-dp-attention \
+  --attention-backend dsv4 \
+  --sampling-backend flashinfer \
+  --mamba-backend triton \
+  --moe-runner-backend deep_gemm \
+  --moe-a2a-backend ncclep \
+  --ncclep-mode low_latency \
+  --ncclep-dispatcher-output-dtype fp8 \
+  --ncclep-config /tmp/ncclep_ll_sm32.json \
+  --disable-overlap-schedule \
+  --disable-cuda-graph \
+  --disable-radix-cache \
+  --disable-chunked-prefix-cache \
+  --disable-shared-experts-fusion \
+  --disable-flashinfer-autotune \
+  --chunked-prefill-size 2048 \
+  --page-size 256 \
+  --max-running-requests 256 \
+  --sm-group-num 8 \
+  --random-seed 42 \
+  --skip-server-warmup
+```
+
+Notes:
+
+- `--ncclep-mode low_latency` is NCCL_EP mode. Do not use `--deepep-mode`.
+- For DSV4 Flash + DeepGEMM, use `--ncclep-dispatcher-output-dtype fp8`.
+- The LL config uses `num_sms=32` and `expert_major`.
+- CUDA graph is still disabled in this validated path.
+
+## 2. Test Guide and Sample Data
+
+### 2.1 Correctness Smoke
+
+Validated script:
+
+```bash
+RUN_ID=clean_commit_correctness_$(date +%Y%m%d_%H%M%S) \
+SGLANG_NCCL_EP_SYNC_MODE=event \
+SGLANG_OPT_SWIGLU_CLAMP_FUSION=true \
+NCCLEP_MAX_DISPATCH=256 \
+/root/menyu/run_dsv4_ncclep_deepgemm_correctness.sh
+```
+
+Latest validated result:
+
+```text
+/root/menyu/ncclep_vs_tp_sglang_dsv4_flash/deepgemm_correctness_clean_commit_correctness_20260625_231230
+```
+
+Expected checks:
+
+- The capital prompt should include Beijing and Tokyo.
+- `17*23+19` should output `410`.
+- `NCCL_EP low_latency shared buffer cache is invalid` count should be `0`.
+- Server log should not contain traceback/runtime error/shape mismatch.
+
+### 2.2 Serving Benchmark
+
+Validated script:
+
+```bash
+RUN_ID=sync_event_latency_$(date +%Y%m%d_%H%M%S) \
+CONFIGS="tp8 tp8_dp dp8_tp dp8_ep_ncclep_ll" \
+SHAPES="8192:1024 1024:1024 1024:8192" \
+NUM_PROMPTS=3 \
+CONCURRENCY=1 \
+NCCLEP_MAX_DISPATCH=256 \
+/root/menyu/run_dsv4_sync_event_latency_matrix.sh
+```
+
+Important benchmark settings:
+
+- Model: `/root/menyu/models/DeepSeek-V4-Flash`
+- Dataset: `random-ids`
+- `--tokenize-prompt`
+- `--random-range-ratio 1.0`
+- `--max-concurrency 1`
+- `--num-prompts 3`
+- Shapes: `8192/1024`, `1024/1024`, `1024/8192`
+- DP+EP: `--tp-size 8 --dp-size 8 --ep-size 8 --enable-dp-attention`
+- NCCL_EP: `low_latency`, FP8 dispatcher output, cap=256
+- DeepGEMM runner, DSV4 attention backend
+
+Latest validated result:
+
+```text
+/root/menyu/ncclep_vs_tp_sglang_dsv4_flash/sync_event_latency_matrix_20260625_115116
+```
+
+Result table:
+
+| Config | ISL | OSL | Mean TTFT ms | Mean TPOT ms | Output tok/s | Total tok/s | Status |
+|---|---:|---:|---:|---:|---:|---:|---|
+| TP | 8192 | 1024 | 24919.38 | 85.84 | 9.08 | 81.75 | PASS |
+| TP | 1024 | 1024 | 2975.47 | 84.47 | 11.46 | 22.91 | PASS |
+| TP | 1024 | 8192 | 2977.47 | 84.58 | 11.77 | 13.25 | PASS |
+| TP+DP | N/A | N/A | N/A | N/A | N/A | N/A | SERVER_FAIL |
+| DP+TP | 8192 | 1024 | 26729.78 | 85.41 | 8.97 | 80.77 | PASS |
+| DP+TP | 1024 | 1024 | 5992.29 | 85.50 | 10.96 | 21.91 | PASS |
+| DP+TP | 1024 | 8192 | 4206.90 | 87.40 | 11.38 | 12.80 | PASS |
+| DP+EP NCCL_EP LL | 8192 | 1024 | 26957.38 | 89.42 | 8.65 | 77.81 | PASS |
+| DP+EP NCCL_EP LL | 1024 | 1024 | 6945.98 | 86.32 | 10.75 | 21.50 | PASS |
+| DP+EP NCCL_EP LL | 1024 | 8192 | 4626.85 | 87.41 | 11.37 | 12.79 | PASS |
+
+TP+DP note:
+
+- `tp=8, dp=8, no-dp-attn` is not a valid single-node 8-GPU setting because it tries to allocate beyond 8 device ordinals.
+- A reduced `tp=4, dp=2, no-dp-attn` variant failed in the DSV4 DeepGEMM `silu_and_mul_masked_post_quant` path.
+- This failure is not NCCL_EP related, so use `TP`, `DP+TP`, and `DP+EP` for NCCL_EP comparison.
+
+### 2.3 Native NCCL_EP SM120 Check
+
+Use the SM120 guide's `ep_bench` before running SGLang:
+
+```bash
+export GPUS=4
+export NCCL_HOME=/root/menyu/nccl/build
+export CUDA_HOME=/usr/local/cuda
+export MPI_HOME=/usr/mpi/gcc/openmpi-4.1.9a1
+export LD_LIBRARY_PATH="${NCCL_HOME}/lib:${MPI_HOME}/lib:${CUDA_HOME}/lib64:${LD_LIBRARY_PATH:-}"
+export CUDA_VISIBLE_DEVICES=0,1,2,3
+export NCCL_EP_JIT_CACHE_DIR=".jit-cache/nccl_ep_jit_sm120_lsa1"
+export NCCL_LSA_TEAM_SIZE=1
+export NCCL_CUMEM_ENABLE=1
+export NCCL_WIN_ENABLE=1
+
+mpirun --allow-run-as-root -np ${GPUS} \
+  -x LD_LIBRARY_PATH -x CUDA_VISIBLE_DEVICES \
+  -x NCCL_LSA_TEAM_SIZE -x NCCL_CUMEM_ENABLE -x NCCL_WIN_ENABLE \
+  -x NCCL_EP_JIT_CACHE_DIR \
+  ${NCCL_HOME}/test/nccl_ep/ep_bench \
   --algorithm ll \
   --layout em \
+  --tokens 4096 \
   --hidden 4096 \
+  --max-num-sms 32 \
+  --validate \
   --top-k 6 \
   --experts 256 \
-  --tokens 128 \
-  --validate
+  --warmup 10 \
+  --iters 50
 ```
 
-3. SGLang synthetic communication boundary：
+For SGLang + DeepGEMM, `expert_major`/`em` is the validated serving layout. `rank_major` can reduce receive-buffer shape in native testing, but it needs extra compaction before grouped GEMM and is not the current clean integration path.
 
-```bash
-source /opt/ncclep/ncclep_env.sh
-bash scripts/run_ncclep_boundary_cases.sh
-```
+## 3. Optimization Summary
 
-4. MoE runner smoke：
+### 3.1 Backend and Semantics
 
-- Triton: `--ncclep-dispatcher-output-dtype bf16`
-- DeepGEMM: `--ncclep-dispatcher-output-dtype fp8`
+- Added NCCL_EP as an independent MoE A2A backend: `--moe-a2a-backend ncclep`.
+- Added NCCL_EP-specific mode: `--ncclep-mode high_throughput | low_latency`.
+- Avoided mixing NCCL_EP semantics with DeepEP mode/config.
+- Added dispatcher output dtype control: `--ncclep-dispatcher-output-dtype bf16 | fp8 | auto`.
 
-5. Server `/generate` correctness：
+### 3.2 DSV4 + DeepGEMM Path
 
-- 固定 deterministic prompt。
-- 使用 chat template / OpenAI chat endpoint，避免 raw generate 造成模型续写异常。
-- HT/LL 分开测，不混用 prefill/decode 语义。
-- Qwen3.5-35B-A3B-FP8 / 5k11 no-NVL / Triton BF16 / NCCL_EP LL 在 no-EPLB 分支上完成回归：`dp-size=4, ep-size=4, enable-dp-attention, ncclep-mode=low_latency, ncclep-dispatcher-output-dtype=bf16`，capital/math `/generate` correctness 通过。
+- Added FP8 activation + scale adapter for NCCL_EP low_latency into DeepGEMM.
+- Added DSV4 FP8xFP4 DeepGEMM wrapper calls for SM120 path.
+- Preserved NCCL_EP shared output buffers by preventing DeepGEMM from disposing them.
+- Added SM120 DeepGEMM enablement in the SGLang wrapper path.
 
-6. Serving benchmark：
+### 3.3 NCCL_EP LL Runtime
 
-- HT: `ISL=1024/8192, OSL=1`，prefill-like。
-- LL: `ISL=1, OSL=1024`，decode-like。
-- 对比 DeepEP 时保持同模型、同 runner、同 dtype、同 CUDA graph/TBO/SBO 开关。
+- Replaced per-dispatch/combine device-wide synchronize with event-based mode:
+  - default: `SGLANG_NCCL_EP_SYNC_MODE=event`
+  - fallback: `SGLANG_NCCL_EP_SYNC_MODE=device`
+- Added deferred NCCL_EP handle destroy using CUDA events.
+- Kept shared-buffer shape validation to catch accidental resize/dispose bugs.
+- Removed temporary LL trace/dump/barrier/debug env paths before committing clean code.
 
-## 已知限制
+### 3.4 Cap and Buffer Tuning
 
-- HT 与 DeepEP normal 在 DSv4 Flash + DeepGEMM + DP attention 下仍有性能差距，主要集中在 EP dispatch/combine 路径，不是 MLP 或 attention 本身。
-- LL 不应作为 prefill 大 token 的性能结论。LL 在 prefill 大 token 下容易放大 expert-major buffer、per-layer routed hotspot 和 no-NVL combine slow path。
-- LL + CUDA graph 尚未作为正式支持路径验证，建议启动期 fail-fast 或关闭 CUDA graph。
-- no-NVL 拓扑下 HT 未作为可用路径确认；LL 需要 `NCCL_LSA_TEAM_SIZE=1` 等配置，并且性能需单独评估。
-- 使用 NCCL upstream 最新 master 时，API/headers/binding 可能变化。每次更新 NCCL 后都必须重新编译 `nccl4py` 并跑 native + SGLang boundary correctness。
-- 当前 NCCL_EP 安装产品化还不是 pip wheel 级别；脚本能从源码自举，但 PR 级部署仍需要进一步收敛版本锁定和 CI 验证。
+- DSV4 non-PD LL serving uses cap=256:
+  - `SGLANG_NCCL_EP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256`
+- cap=128 can be useful for decode-only/PD-D style tests, but it fails prefill chunks that reach 256 tokens.
+- cap=512 is stable but increases masked DeepGEMM buffer and temporary tensor cost.
+- Current no-NVL SM120 path uses:
+  - `NCCL_LSA_TEAM_SIZE=1`
+  - `NCCL_NET_MERGE_LEVEL=LOC`
+  - `NCCL_NVLS_ENABLE=0`
 
-## 推荐 PR 表述边界
+### 3.5 Current Known Limits
 
-可以表述：
+- CUDA graph remains disabled for this validated NCCL_EP LL path.
+- DP+EP is close to DP+TP at `CC=1`, but does not clearly outperform it yet.
+- Performance work should focus on:
+  - expert-major buffer/layout overhead
+  - DeepGEMM masked path capacity cost
+  - real routing long-tail on no-NVL topology
+  - CUDA graph capture safety
+  - static/dynamic expert placement and load balance
 
-- NCCL_EP backend 已独立于 DeepEP backend。
-- 支持 `high_throughput` 和 `low_latency` 两种 NCCL_EP mode。
-- 支持 Triton BF16 和 DeepGEMM FP8 两类 runner 适配。
-- 支持从干净容器下载、编译、安装 NCCL/NCCL_EP，不强依赖本地 `/root/menyu/nccl`。
+## 4. Quick Recap
 
-暂不建议表述：
+The clean SM120 reproduction path is:
 
-- NCCL_EP 全面优于 DeepEP。
-- LL 适合作为 prefill 性能路径。
-- FlashInfer/Cutlass/AITER 等 runner 已支持。
-- no-NVL 拓扑下 HT 已稳定可用。
+1. Use our SGLang fork and NCCL_EP integration branch.
+2. Build NCCL/NCCL_EP with the SM120 low_latency patch from `qijiaxing/nccl`.
+3. Source `ncclep_env.sh` so SGLang loads the matching NCCL/NCCL_EP pair.
+4. Run DSV4 Flash with DeepGEMM, DP attention, NCCL_EP low_latency, FP8 dispatcher output, `num_sms=32`, cap=256.
+5. Validate with correctness prompts and then run the latency matrix.
