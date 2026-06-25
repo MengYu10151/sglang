@@ -221,7 +221,6 @@ class _EpV2Impl:
         self.num_max_dispatch_tokens_per_rank = num_max_dispatch_tokens_per_rank
         self.rank = dist.get_rank(group)
         self._handle = None
-        self._num_input_tokens = 0
 
     def set_runner_capability(self, capability: EpV2RunnerCapability) -> None:
         if self.capability != capability:
@@ -273,7 +272,6 @@ class _EpV2Impl:
         topk_weights = topk_output.topk_weights
         topk_ids = topk_output.topk_ids.to(torch.int64)
         self._validate_common(hidden_states, topk_ids)
-        self._num_input_tokens = hidden_states.shape[0]
         # EPv2 native expanded layout is profitable for direct/decode-like
         # DeepGEMM FP8 workloads, but regresses hybrid/prefill-like workloads.
         # Keep hybrid on the native default non-expanded layout.
@@ -305,18 +303,19 @@ class _EpV2Impl:
             dispatch_x = hidden_states
             use_tma_aligned_col_major_sf = False
 
+        # num_max_tokens_per_rank is a COLLECTIVE dispatch arg (ElasticBuffer
+        # requires the same value on all ranks). Keep it at the fixed buffer cap
+        # (class-level, cross-rank-consistent), matching DeepEP LL which uses a
+        # fixed _num_max_dispatch_tokens_per_rank rather than a per-forward token
+        # count. Do NOT derive it from the local hidden_states.shape[0]: under
+        # ragged DP load (or TP attention) the ranks would disagree on this
+        # collective arg. The masked slab max_m is sized separately below from the
+        # local actual batch (an adapter-local tensor, per-rank independent), so
+        # we still get exp1's dynamic-slab benefit without touching the collective.
         num_max_tokens = self.num_max_dispatch_tokens_per_rank
         do_cpu_sync_val = None
         if use_masked:
             do_cpu_sync_val = False
-            # Experiment 1: tighten the per-call dispatch capacity (and thus the
-            # masked slab max_m = num_max_tokens * ep_group_size) to the ACTUAL
-            # decode batch instead of the buffer cap. The buffer cap stays at
-            # num_max_dispatch_tokens_per_rank (prefill-safe). All DP ranks share
-            # the same batch (DP-synced), and under cuda graph _num_input_tokens
-            # is static per captured bs, so the masked shapes stay static. This
-            # shrinks the masked-GEMM grid + per-step allocations for decode.
-            num_max_tokens = self._num_input_tokens
 
         buffer = self._get_buffer()
         self._destroy_handle()
@@ -374,20 +373,25 @@ class _EpV2Impl:
             # the local token count. group size == ep world size ==
             # num_experts // num_local_experts.
             ep_group_size = max(1, self.num_experts // self.num_local_experts)
+            # Size the masked slab to the FIXED worst case cap * ep_group_size,
+            # matching DeepEP LL. A local expert receives the sum over all ranks
+            # of the tokens routed to it; each rank sends at most `cap` tokens
+            # (enforced by the dispatch-entry assert), so the per-expert receive
+            # count is bounded by cap * ep_group_size regardless of DP padding
+            # mode (MAX_LEN / SUM_LEN / skewed load). Using the local batch here
+            # was unsafe: under SUM_LEN decode (skewed) other ranks can have a
+            # larger batch and overflow this rank's slab. expected_m (a GEMM
+            # schedule hint, not a hard bound) likewise uses the fixed cap.
+            cap_per_rank = self.num_max_dispatch_tokens_per_rank
             expected_m = max(
                 1,
                 (
-                    self._num_input_tokens * ep_group_size * self.router_topk
+                    cap_per_rank * ep_group_size * self.router_topk
                     + self.num_experts
                 )
                 // self.num_experts,
             )
-            # Experiment 1: size the masked slab to actual-batch * ep_group_size
-            # (= the per-call dispatch num_max_tokens * num_ranks). A local expert
-            # can receive at most (batch) tokens from each rank, so this is still
-            # the true worst case for this decode step; the kernel-level overflow
-            # guard defends against any misconfig.
-            masked_max_m = self._num_input_tokens * ep_group_size
+            masked_max_m = cap_per_rank * ep_group_size
             total_expanded = recv_hidden_states.shape[0]
 
         return EpV2DispatchOutput(
