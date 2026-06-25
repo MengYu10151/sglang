@@ -4,11 +4,22 @@
 后端名是 `epv2`，语义上与已有的 legacy `deepep` 后端分离，不复用
 DeepEP v1 的 dispatcher 对象、mode 语义或 dispatch/combine 数据结构。
 
+## 收口状态（2026-06-25，以本节为准）
+
+> 下面「最终设计总览（2026-06-23）」及 exp1 等小节是更早的优化历程，**perf 数字与 exp1「反超 LL +5.4%」结论已被本节取代**，设计与坑仍可参考。
+
+- **生产口径真实 gap：decode（masked + 全 CUDA graph）比 DeepEP LL 慢 ~1.75%。** 测量口径：普通 server（**不是** disagg decode-only fake，后者会放大到 ~12%）、DSv4-Flash-FP8 / H20×8 / DP attn / deep_gemm / cap=128 / ISL=1 OSL=1024 / CC=1024 满批。EPv2 14670 vs LL 14932 tok/s。
+- **exp1（动态 masked slab 尺寸）已回退**（commit `5314799`）：改回固定 `cap × ep_group_size`。原因 ① ragged DP（SUM_LEN/skewed）下按本地 batch 定尺会溢出本地 slab，不安全；② 打满时 batch=cap，max_m 与 LL 恒等，exp1 优势本就归零。
+- **repack 向量化**（commit `91592c5`，本轮主要优化）：`expand_to_masked_slab` / `masked_slab_to_expand` 从「grid=32、串行逐行拷」改成 2D block-row grid（`(E, cdiv(MAX_M,8))`，每 program 拷 8 行，cuda-graph-safe）。repack 56.7→8.6ms；**combine 自愈 57.2→35.5ms（未改 combine，repack 均匀后消除 rank 失同步，spin-wait 尾部收缩，反超 LL 41ms）**；总 GPU kernel 576.7→505.1ms（LL 501.2，≈parity）；吞吐 14118→14670（−5.6%→−1.75%）。
+- **combine gap 根因 = repack 引起的 spin-wait，不是 combine kernel**：EPv2 combine 中位 23µs 比 LL 31µs 快（单测与生产 trace 一致），慢的是被 repack 拖出的尾部；repack 向量化后该尾部自动收敛。
+- **contiguous（免 repack）= 死路**（A/B 实测否决）：关 graph 下 contig≈masked（do_cpu_sync host 气泡抵消省下的 repack）；且 contiguous 的 do_cpu_sync=True 不能 cuda-graph capture → 拿不到 cuda graph 的 **2.7×**（masked+graph 14077 vs nograph 5170）。**生产必须 masked + 全 CUDA graph。**
+- 残余 −1.75% 主要是 quant +2.7ms（不可消，native dispatch 要预量化 fp8）+ per-step 墙钟/噪声；GPU-kernel 已与 LL parity，repack 这条线挖到底。
+
 ## 最终设计总览（2026-06-23）
 
 这一节是当前分支的状态页。相比早期版本，本轮把 **direct decode 改成了 masked-GEMM path**，
 并在 direct 模式下**打开了 CUDA graph**，decode 性能从慢于 DeepEP LL 约 9.6% 翻转为
-与 DeepEP LL 持平/略快。下面详细描述最终设计、性能数据、根因与优化历程；更早期的
+与 DeepEP LL 持平/略快（**注：该「持平/略快」基于已回退的 exp1；当前真实为慢 ~1.75%，见顶部收口状态**）。下面详细描述最终设计、性能数据、根因与优化历程；更早期的
 expanded→contiguous / 关 CUDA graph 调查保留在文末「历史 profiling 与设计演进」一节，仅作记录。
 
 ### 当前完成状态
