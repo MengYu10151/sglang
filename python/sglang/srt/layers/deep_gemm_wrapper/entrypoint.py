@@ -18,7 +18,13 @@ logger = logging.getLogger(__name__)
 
 if ENABLE_JIT_DEEPGEMM:
     import deep_gemm
-    from deep_gemm.utils.layout import get_mn_major_tma_aligned_tensor  # noqa: F401
+
+    try:
+        from deep_gemm.utils.layout import (  # noqa: F401
+            get_mn_major_tma_aligned_tensor,
+        )
+    except ImportError:
+        from deep_gemm import get_mn_major_tma_aligned_tensor  # noqa: F401
 
 _SANITY_CHECK = envs.SGLANG_DEEPGEMM_SANITY_CHECK.get()
 
@@ -75,6 +81,39 @@ def grouped_gemm_nt_f8f8bf16_masked(
                     else {}
                 ),
             )
+
+
+def grouped_gemm_nt_f8fp4bf16_masked(
+    lhs: Tuple[torch.Tensor, torch.Tensor],
+    rhs: Tuple[torch.Tensor, torch.Tensor],
+    out: torch.Tensor,
+    masked_m: torch.Tensor,
+    expected_m: int,
+    recipe_a: Tuple[int, int],
+    recipe_b: Tuple[int, int],
+):
+    num_groups, _, k = lhs[0].shape
+    _, n, _ = rhs[0].shape
+    kernel_type = compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED
+
+    _sanity_check_input(lhs)
+
+    lhs = _ensure_cuda(lhs)
+    rhs = _ensure_cuda(rhs)
+
+    with compile_utils.deep_gemm_execution_hook(
+        expected_m, n, k, num_groups, kernel_type
+    ):
+        return deep_gemm.m_grouped_fp8_fp4_gemm_nt_masked(
+            lhs,
+            rhs,
+            out,
+            masked_m,
+            expected_m,
+            recipe_a=recipe_a,
+            recipe_b=recipe_b,
+            disable_ue8m0_cast=not DEEPGEMM_SCALE_UE8M0,
+        )
 
 
 def _ensure_cuda(
@@ -136,6 +175,35 @@ def grouped_gemm_nt_f8f8bf16_contig(
     with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
         deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
             lhs, rhs, out, m_indices, **fp4_kwargs
+        )
+
+
+def grouped_gemm_nt_f8fp4bf16_contig(
+    lhs: Tuple[torch.Tensor, torch.Tensor],
+    rhs: Tuple[torch.Tensor, torch.Tensor],
+    out: torch.Tensor,
+    m_indices: torch.Tensor,
+    recipe_a: Tuple[int, int],
+    recipe_b: Tuple[int, int],
+):
+    m, k = lhs[0].shape
+    num_groups, n, _ = rhs[0].shape
+    kernel_type = compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG
+
+    if m == 0:
+        return
+
+    _sanity_check_input(lhs)
+
+    with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
+        deep_gemm.m_grouped_fp8_fp4_gemm_nt_contiguous(
+            lhs,
+            rhs,
+            out,
+            m_indices,
+            recipe_a=recipe_a,
+            recipe_b=recipe_b,
+            disable_ue8m0_cast=not DEEPGEMM_SCALE_UE8M0,
         )
 
 

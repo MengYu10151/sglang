@@ -10,7 +10,6 @@ from typing import List, NamedTuple, Optional, Tuple
 import torch
 import torch.distributed as dist
 
-from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.moe.token_dispatcher.base import (
@@ -250,8 +249,18 @@ def _stream() -> int:
     return torch.cuda.current_stream().cuda_stream
 
 
+def _sync_mode() -> str:
+    mode = os.getenv("SGLANG_NCCL_EP_SYNC_MODE", "event").lower()
+    if mode not in ("event", "device"):
+        raise ValueError(
+            "SGLANG_NCCL_EP_SYNC_MODE must be 'event' or 'device', "
+            f"got {mode!r}"
+        )
+    return mode
+
+
 def _maybe_synchronize() -> None:
-    if os.getenv("SGLANG_NCCL_EP_SKIP_SYNC") != "1":
+    if _sync_mode() == "device":
         torch.cuda.synchronize()
 
 
@@ -449,7 +458,42 @@ class NcclEpBuffer:
             scale_shape if output_dtype == NcclEpOutputDtype.FP8 else None,
             count_shape,
         )
-        if cls._ll_buffer_key != key:
+        needs_allocate = cls._ll_buffer_key != key
+        if not needs_allocate:
+            needs_allocate = (
+                cls._ll_output_tokens is None
+                or cls._ll_recv_count is None
+                or tuple(cls._ll_output_tokens.shape) != token_shape
+                or tuple(cls._ll_recv_count.shape) != count_shape
+                or (
+                    output_dtype == NcclEpOutputDtype.FP8
+                    and (
+                        cls._ll_output_scales is None
+                        or tuple(cls._ll_output_scales.shape) != scale_shape
+                    )
+                )
+                or (
+                    output_dtype != NcclEpOutputDtype.FP8
+                    and cls._ll_output_scales is not None
+                )
+            )
+            if needs_allocate:
+                logger.warning(
+                    "NCCL_EP low_latency shared buffer cache is invalid; "
+                    "reallocating tokens=%s scales=%s recv_count=%s expected_tokens=%s",
+                    None
+                    if cls._ll_output_tokens is None
+                    else tuple(cls._ll_output_tokens.shape),
+                    None
+                    if cls._ll_output_scales is None
+                    else tuple(cls._ll_output_scales.shape),
+                    None
+                    if cls._ll_recv_count is None
+                    else tuple(cls._ll_recv_count.shape),
+                    token_shape,
+                )
+
+        if needs_allocate:
             cls._ll_output_tokens = torch.empty(
                 token_shape,
                 dtype=(
@@ -533,6 +577,7 @@ class _NcclEpImplBase:
         self.world_size = dist.get_world_size(group)
         self.rank = dist.get_rank(group)
         self._handle = None
+        self._deferred_handle_destroys = []
 
     @property
     def max_recv_tokens_per_rank(self) -> int:
@@ -558,10 +603,44 @@ class _NcclEpImplBase:
     def _uses_fp8_dispatch_output(self) -> bool:
         return self.output_dtype == NcclEpOutputDtype.FP8
 
+    def _process_deferred_handle_destroys(self, force: bool = False) -> None:
+        remaining = []
+        for handle, event in self._deferred_handle_destroys:
+            if force or event.query():
+                try:
+                    handle.destroy()
+                except Exception:
+                    logger.debug("Failed to destroy NCCL_EP handle", exc_info=True)
+            else:
+                remaining.append((handle, event))
+        self._deferred_handle_destroys = remaining
+
+    def _defer_or_destroy_handle(self, handle) -> None:
+        if _sync_mode() == "device":
+            handle.destroy()
+            return
+        event = torch.cuda.Event()
+        event.record(torch.cuda.current_stream())
+        self._deferred_handle_destroys.append((handle, event))
+        self._process_deferred_handle_destroys()
+
     def _destroy_handle(self) -> None:
+        self._process_deferred_handle_destroys()
         if self._handle is not None:
-            self._handle.destroy()
+            self._defer_or_destroy_handle(self._handle)
             self._handle = None
+
+    def __del__(self):
+        try:
+            if self._handle is not None:
+                try:
+                    self._handle.destroy()
+                except Exception:
+                    pass
+                self._handle = None
+            self._process_deferred_handle_destroys(force=True)
+        except Exception:
+            pass
 
     def _validate_common(
         self, hidden_states: torch.Tensor, topk_ids: torch.Tensor
@@ -589,41 +668,6 @@ class _NcclEpImplBase:
             raise ValueError(
                 f"NCCL_EP low_latency supports topk <= {_LL_MAX_TOPK}, got {topk_ids.shape[1]}"
             )
-        if os.getenv("SGLANG_NCCLEP_DEBUG_TOPK"):
-            if topk_ids.numel() > 0:
-                topk_min = int(topk_ids.min().item())
-                topk_max = int(topk_ids.max().item())
-                if topk_min < 0 or topk_max >= self.num_experts:
-                    raise ValueError(
-                        "NCCL_EP topk_ids out of global expert range: "
-                        f"rank={self.rank} range=[{topk_min}, {topk_max}] "
-                        f"num_experts={self.num_experts} shape={tuple(topk_ids.shape)}"
-                    )
-                debug_count = getattr(self, "_debug_topk_logs", 0)
-                debug_limit = int(os.getenv("SGLANG_NCCLEP_DEBUG_TOPK_LIMIT", "4"))
-                if debug_count < debug_limit:
-                    dest_ranks = torch.div(
-                        topk_ids, self.num_local_experts, rounding_mode="floor"
-                    )
-                    dest_counts = torch.bincount(
-                        dest_ranks.reshape(-1), minlength=self.world_size
-                    )[: self.world_size].cpu().tolist()
-                    logger.info(
-                        "NCCL_EP debug topk rank=%s mode=%s hidden_shape=%s "
-                        "hidden_stride=%s contiguous=%s dtype=%s topk_shape=%s "
-                        "range=[%s,%s] dest_counts=%s",
-                        self.rank,
-                        self.mode.value,
-                        tuple(hidden_states.shape),
-                        tuple(hidden_states.stride()),
-                        hidden_states.is_contiguous(),
-                        hidden_states.dtype,
-                        tuple(topk_ids.shape),
-                        topk_min,
-                        topk_max,
-                        dest_counts,
-                    )
-                    self._debug_topk_logs = debug_count + 1
 
 
 class _NcclEpHighThroughputImpl(_NcclEpImplBase):
@@ -940,146 +984,21 @@ class _NcclEpLowLatencyImpl(_NcclEpImplBase):
         topk_weights = topk_output.topk_weights.contiguous()
         topk_ids = topk_output.topk_ids.to(torch.int64).contiguous()
         self._topk_ids = topk_ids
-        trace_ll = os.getenv("SGLANG_NCCLEP_TRACE_LL")
-        trace_id = getattr(self, "_trace_ll_dispatch_id", 0)
-        self._trace_ll_dispatch_id = trace_id + 1
-        if trace_ll:
-            logger.info(
-                "NCCL_EP LL trace rank=%s call=%s phase=dispatch_begin "
-                "layer=%s tokens=%s hidden_shape=%s topk_shape=%s",
-                self.rank,
-                trace_id,
-                self.layer_id,
-                hidden_states.shape[0],
-                tuple(hidden_states.shape),
-                tuple(topk_ids.shape),
-            )
         self._validate_common(hidden_states, topk_ids)
-        dump_dir = os.getenv("SGLANG_NCCLEP_DUMP_TOPK_DIR")
-        if dump_dir and hidden_states.shape[0] > 0:
-            try:
-                path = Path(dump_dir)
-                path.mkdir(parents=True, exist_ok=True)
-                valid_topk_ids = topk_ids[topk_ids >= 0]
-                dest_ranks = torch.div(
-                    valid_topk_ids, self.num_local_experts, rounding_mode="floor"
-                )
-                dest_counts = torch.bincount(
-                    dest_ranks.reshape(-1), minlength=self.world_size
-                )[: self.world_size]
-                torch.save(
-                    {
-                        "rank": self.rank,
-                        "layer_id": self.layer_id,
-                        "tokens_shape": tuple(hidden_states.shape),
-                        "topk_shape": tuple(topk_ids.shape),
-                        "dest_counts": dest_counts.detach().cpu(),
-                        "valid_topk_count": int(valid_topk_ids.numel()),
-                    },
-                    path / f"rank{self.rank}_layer{self.layer_id}_call{trace_id}.pt",
-                )
-            except Exception as exc:
-                logger.warning("NCCL_EP LL topk dump failed: %s", exc)
-        if trace_ll:
-            logger.info(
-                "NCCL_EP LL trace rank=%s call=%s phase=after_validate_common",
-                self.rank,
-                trace_id,
-            )
-        if trace_ll:
-            logger.info(
-                "NCCL_EP LL trace rank=%s call=%s phase=before_get_ep",
-                self.rank,
-                trace_id,
-            )
         _, ep_group = self._get_ep()
-        if trace_ll:
-            logger.info(
-                "NCCL_EP LL trace rank=%s call=%s phase=after_get_ep",
-                self.rank,
-                trace_id,
-            )
         num_tokens = hidden_states.shape[0]
         self._ensure_buffers()
-        if trace_ll:
-            logger.info(
-                "NCCL_EP LL trace rank=%s call=%s phase=after_ensure_buffers "
-                "max_slots=%s",
-                self.rank,
-                trace_id,
-                self.max_recv_tokens_per_rank,
-            )
         self._recv_count.zero_()
         self._output_tokens.zero_()
         if self._output_scales is not None:
             self._output_scales.zero_()
 
-        if os.getenv("SGLANG_NCCLEP_PRESYNC_DISPATCH"):
-            torch.cuda.synchronize()
-
-        if trace_ll:
-            logger.info(
-                "NCCL_EP LL trace rank=%s call=%s phase=before_create_handle",
-                self.rank,
-                trace_id,
-            )
-        if os.getenv("SGLANG_NCCLEP_BARRIER_BEFORE_DISPATCH"):
-            if trace_ll:
-                logger.info(
-                    "NCCL_EP LL trace rank=%s call=%s phase=before_barrier",
-                    self.rank,
-                    trace_id,
-                )
-            dist.barrier(group=self.group)
-            if trace_ll:
-                logger.info(
-                    "NCCL_EP LL trace rank=%s call=%s phase=after_barrier",
-                    self.rank,
-                    trace_id,
-                )
-        if os.getenv("SGLANG_NCCLEP_WORLD_BARRIER_BEFORE_DISPATCH"):
-            if trace_ll:
-                logger.info(
-                    "NCCL_EP LL trace rank=%s call=%s phase=before_world_barrier "
-                    "world_size=%s group_size=%s",
-                    self.rank,
-                    trace_id,
-                    dist.get_world_size(),
-                    dist.get_world_size(group=self.group),
-                )
-            dist.barrier()
-            if trace_ll:
-                logger.info(
-                    "NCCL_EP LL trace rank=%s call=%s phase=after_world_barrier",
-                    self.rank,
-                    trace_id,
-                )
-        if os.getenv("SGLANG_NCCLEP_TP_CPU_BARRIER_BEFORE_DISPATCH"):
-            if trace_ll:
-                logger.info(
-                    "NCCL_EP LL trace rank=%s call=%s phase=before_tp_cpu_barrier",
-                    self.rank,
-                    trace_id,
-                )
-            get_tp_group().barrier()
-            if trace_ll:
-                logger.info(
-                    "NCCL_EP LL trace rank=%s call=%s phase=after_tp_cpu_barrier",
-                    self.rank,
-                    trace_id,
-                )
         self._destroy_handle()
         self._handle = ep_group.create_handle(
             Layout.EXPERT_MAJOR,
             Tensor(self._topk_ids),
             stream=_stream(),
         )
-        if trace_ll:
-            logger.info(
-                "NCCL_EP LL trace rank=%s call=%s phase=after_create_handle",
-                self.rank,
-                trace_id,
-            )
         output_tokens = Tensor(self._output_tokens)
         output_scales = (
             Tensor(self._output_scales) if self._output_scales is not None else None
@@ -1099,12 +1018,6 @@ class _NcclEpLowLatencyImpl(_NcclEpImplBase):
             **({"scales": output_scales} if output_scales is not None else {}),
         )
         dispatch_config = DispatchConfig(round_scales=0)
-        if trace_ll:
-            logger.info(
-                "NCCL_EP LL trace rank=%s call=%s phase=before_dispatch",
-                self.rank,
-                trace_id,
-            )
         self._handle.dispatch(
             dispatch_inputs,
             dispatch_outputs,
@@ -1112,41 +1025,8 @@ class _NcclEpLowLatencyImpl(_NcclEpImplBase):
             config=dispatch_config,
             stream=_stream(),
         )
-        if trace_ll:
-            logger.info(
-                "NCCL_EP LL trace rank=%s call=%s phase=after_dispatch_before_complete",
-                self.rank,
-                trace_id,
-            )
-        if os.getenv("SGLANG_NCCLEP_TP_CPU_BARRIER_AFTER_DISPATCH"):
-            if trace_ll:
-                logger.info(
-                    "NCCL_EP LL trace rank=%s call=%s phase=before_tp_cpu_barrier_after_dispatch",
-                    self.rank,
-                    trace_id,
-                )
-            get_tp_group().barrier()
-            if trace_ll:
-                logger.info(
-                    "NCCL_EP LL trace rank=%s call=%s phase=after_tp_cpu_barrier_after_dispatch",
-                    self.rank,
-                    trace_id,
-                )
         self._handle.complete(stream=_stream())
-        if trace_ll:
-            logger.info(
-                "NCCL_EP LL trace rank=%s call=%s phase=after_complete_before_sync",
-                self.rank,
-                trace_id,
-            )
         _maybe_synchronize()
-        if trace_ll:
-            logger.info(
-                "NCCL_EP LL trace rank=%s call=%s phase=after_sync recv_count_sum=%s",
-                self.rank,
-                trace_id,
-                int(self._recv_count.sum().item()),
-            )
 
         expected_m = (
             num_tokens * self.world_size * self.router_topk + self.num_experts
@@ -1163,19 +1043,6 @@ class _NcclEpLowLatencyImpl(_NcclEpImplBase):
     def combine(self, combine_input: NcclEpLowLatencyCombineInput) -> torch.Tensor:
         hidden_states, topk_ids, topk_weights = combine_input
         num_tokens = topk_weights.shape[0]
-        trace_ll = os.getenv("SGLANG_NCCLEP_TRACE_LL")
-        trace_id = getattr(self, "_trace_ll_combine_id", 0)
-        self._trace_ll_combine_id = trace_id + 1
-        if trace_ll:
-            logger.info(
-                "NCCL_EP LL trace rank=%s call=%s phase=combine_begin "
-                "layer=%s tokens=%s hidden_shape=%s",
-                self.rank,
-                trace_id,
-                self.layer_id,
-                num_tokens,
-                tuple(hidden_states.shape),
-            )
         combined = torch.empty(
             (num_tokens, self.hidden_size),
             dtype=torch.bfloat16,
@@ -1187,40 +1054,15 @@ class _NcclEpLowLatencyImpl(_NcclEpImplBase):
             topk_weights=Tensor(topk_weights),
         )
         combine_config = CombineConfig(send_only=0)
-        if trace_ll:
-            logger.info(
-                "NCCL_EP LL trace rank=%s call=%s phase=before_combine",
-                self.rank,
-                trace_id,
-            )
         self._handle.combine(
             combine_inputs,
             combine_outputs,
             config=combine_config,
             stream=_stream(),
         )
-        if trace_ll:
-            logger.info(
-                "NCCL_EP LL trace rank=%s call=%s phase=after_combine_before_complete",
-                self.rank,
-                trace_id,
-            )
         self._handle.complete(stream=_stream())
-        if trace_ll:
-            logger.info(
-                "NCCL_EP LL trace rank=%s call=%s phase=combine_after_complete_before_sync",
-                self.rank,
-                trace_id,
-            )
         _maybe_synchronize()
-        if trace_ll:
-            logger.info(
-                "NCCL_EP LL trace rank=%s call=%s phase=combine_after_sync",
-                self.rank,
-                trace_id,
-            )
-        if not os.getenv("SGLANG_NCCLEP_DEFER_HANDLE_DESTROY"):
-            self._destroy_handle()
+        self._destroy_handle()
         return combined
 
 

@@ -71,18 +71,14 @@ _NCCLEP_HT_EXPERT_ALIGNMENT = 128
 
 # TODO(kaixih@nvidia): ideally we should merge this logic into
 # `fill_gateup_input_triton_kernel` to directly generate e8m0 scale.
-@torch.compile(disable=_is_hip or _is_npu)
 def _cast_to_e8m0_with_rounding_up(x: torch.Tensor) -> torch.Tensor:
-    temp = x.to(torch.float32).view(torch.int32)
-    exp = torch.bitwise_right_shift(temp, 23)
-    mant = torch.bitwise_and(temp, 0x7FFFFF)
-    is_ru = torch.logical_and(
-        torch.logical_and((mant > 0), (exp != 0xFE)),
-        ~torch.logical_and((exp == 0), (mant <= 0x400000)),
+    import deep_gemm
+
+    from sglang.srt.layers.quantization.fp8_utils import ceil_to_ue8m0
+
+    return deep_gemm.get_mn_major_tma_aligned_packed_ue8m0_tensor(
+        ceil_to_ue8m0(x.to(torch.float32))
     )
-    exp = torch.where(is_ru, exp + 1, exp)
-    new_x = exp.to(torch.uint8).view(torch.int)
-    return new_x.transpose(1, 2).contiguous().transpose(1, 2)
 
 
 def copy_list_to_gpu_no_ce(arr: List[int]):
@@ -143,6 +139,8 @@ class DeepGemmRunnerInput(RunnerInput):
     masked_m: Optional[torch.Tensor] = None
     expected_m: Optional[int] = None
     m_indices: Optional[torch.Tensor] = None
+    dispose_hidden_states: bool = True
+    dispose_hidden_states_scale: bool = True
 
     @property
     def runner_backend(self) -> MoeRunnerBackend:
@@ -224,6 +222,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
 
         hidden_states = runner_input.hidden_states
         hidden_states_scale = runner_input.hidden_states_scale
+        original_hidden_states_scale = hidden_states_scale
         all_tokens = running_state["all_tokens"]
         hidden_states_device = running_state["hidden_states_device"]
         hidden_states_dtype = running_state["hidden_states_dtype"]
@@ -243,6 +242,11 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             quant_info.w13_scale,
         )
         w2_weight_fp8 = (quant_info.w2_weight, quant_info.w2_scale)
+        grouped_gemm_contig = (
+            deep_gemm_wrapper.grouped_gemm_nt_f8fp4bf16_contig
+            if quant_info.is_fp4_experts
+            else deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_contig
+        )
 
         gateup_output = torch.empty(
             (all_tokens, N),
@@ -252,7 +256,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         if deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES:
             hidden_states_scale = tma_align_input_scale(hidden_states_scale)
 
-        deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_contig(
+        grouped_gemm_contig(
             (hidden_states, hidden_states_scale),
             w13_weight_fp8,
             gateup_output,
@@ -261,8 +265,13 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             recipe_b=recipe_b,
         )
 
-        dispose_tensor(hidden_states)
-        dispose_tensor(hidden_states_scale)
+        if runner_input.dispose_hidden_states:
+            dispose_tensor(hidden_states)
+        if (
+            runner_input.dispose_hidden_states_scale
+            or hidden_states_scale is not original_hidden_states_scale
+        ):
+            dispose_tensor(hidden_states_scale)
 
         if envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.get():
             swiglu_limit_arg: Optional[float] = self.swiglu_limit
@@ -332,7 +341,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         if deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES:
             down_input_scale = tma_align_input_scale(down_input_scale)
 
-        deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_contig(
+        grouped_gemm_contig(
             (down_input_fp8, down_input_scale),
             w2_weight_fp8,
             down_output,
@@ -418,6 +427,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
 
         hidden_states = runner_input.hidden_states
         hidden_states_scale = runner_input.hidden_states_scale
+        original_hidden_states_scale = hidden_states_scale
         masked_m = runner_input.masked_m
         expected_m = runner_input.expected_m
 
@@ -428,6 +438,11 @@ class DeepGemmRunnerCore(MoeRunnerCore):
 
         recipe_a, recipe_b = (
             ((1, 128), (1, 32)) if quant_info.is_fp4_experts else (None, None)
+        )
+        grouped_gemm_masked = (
+            deep_gemm_wrapper.grouped_gemm_nt_f8fp4bf16_masked
+            if quant_info.is_fp4_experts
+            else deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked
         )
 
         hidden_states_device = running_state["hidden_states_device"]
@@ -452,7 +467,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         gateup_output = torch.empty(
             (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
         )
-        deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
+        grouped_gemm_masked(
             (hidden_states, hidden_states_scale),
             (w13_weight, w13_scale),
             gateup_output,
@@ -461,8 +476,13 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             recipe_a=recipe_a,
             recipe_b=recipe_b,
         )
-        dispose_tensor(hidden_states)
-        dispose_tensor(hidden_states_scale)
+        if runner_input.dispose_hidden_states:
+            dispose_tensor(hidden_states)
+        if (
+            runner_input.dispose_hidden_states_scale
+            or hidden_states_scale is not original_hidden_states_scale
+        ):
+            dispose_tensor(hidden_states_scale)
 
         swiglu_limit_arg: Optional[float] = None
         if self.swiglu_limit is not None:
@@ -514,6 +534,10 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         down_gemm_overlap_args = running_state.get("down_gemm_overlap_args", None)
         if down_gemm_overlap_args is None:
             gemm_overlap_args_dict = {}
+        elif quant_info.is_fp4_experts:
+            # DeepGEMM's FP8xFP4 grouped masked API does not expose the overlap
+            # kwargs used by the FP8xFP8 masked path.
+            gemm_overlap_args_dict = {}
         else:
             down_gemm_overlap_args.start_event.record()
             max_block_n = (
@@ -524,7 +548,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 "max_block_n": max_block_n,
             }
 
-        deep_gemm_return_value = deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
+        deep_gemm_return_value = grouped_gemm_masked(
             (down_input, down_input_scale),
             (w2_weight, w2_scale),
             down_output,
@@ -1015,6 +1039,8 @@ def pre_permute_ncclep_low_latency_to_deep_gemm(
         use_masked_gemm=True,
         masked_m=masked_m,
         expected_m=expected_m,
+        dispose_hidden_states=False,
+        dispose_hidden_states_scale=False,
     )
 
 
