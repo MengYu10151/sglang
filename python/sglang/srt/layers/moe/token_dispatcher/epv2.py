@@ -309,9 +309,9 @@ class _EpV2Impl:
         # fixed _num_max_dispatch_tokens_per_rank rather than a per-forward token
         # count. Do NOT derive it from the local hidden_states.shape[0]: under
         # ragged DP load (or TP attention) the ranks would disagree on this
-        # collective arg. The masked slab max_m is sized separately below from the
-        # local actual batch (an adapter-local tensor, per-rank independent), so
-        # we still get exp1's dynamic-slab benefit without touching the collective.
+        # collective arg. (The masked slab max_m below is likewise fixed at
+        # cap * ep_group_size for the same cross-rank / overflow safety; only
+        # expected_m, a per-rank-local GEMM schedule hint, uses the actual batch.)
         num_max_tokens = self.num_max_dispatch_tokens_per_rank
         do_cpu_sync_val = None
         if use_masked:
@@ -367,31 +367,32 @@ class _EpV2Impl:
         masked_max_m = 0
         total_expanded = 0
         if use_masked:
-            # Align expected_m with DeepEP LL (deepep.py dispatch_a): it is the
-            # average tokens-per-expert across the whole EP group, so the global
-            # token count (local tokens * EP group size) must be used, not just
-            # the local token count. group size == ep world size ==
-            # num_experts // num_local_experts.
+            # expected_m: average tokens-per-expert across the EP group, a
+            # per-rank-local schedule hint for the masked GEMM (NOT a hard bound;
+            # the real per-expert bound is masked_m on the GPU). Derive it from
+            # the actual local batch * EP group size, matching DeepEP LL
+            # (deepep.py dispatch_a uses hidden_states.shape[0]). Per-rank-local,
+            # so the actual batch is safe here even under ragged DP. group size
+            # == ep world size == num_experts // num_local_experts.
             ep_group_size = max(1, self.num_experts // self.num_local_experts)
-            # Size the masked slab to the FIXED worst case cap * ep_group_size,
-            # matching DeepEP LL. A local expert receives the sum over all ranks
-            # of the tokens routed to it; each rank sends at most `cap` tokens
-            # (enforced by the dispatch-entry assert), so the per-expert receive
-            # count is bounded by cap * ep_group_size regardless of DP padding
-            # mode (MAX_LEN / SUM_LEN / skewed load). Using the local batch here
-            # was unsafe: under SUM_LEN decode (skewed) other ranks can have a
-            # larger batch and overflow this rank's slab. expected_m (a GEMM
-            # schedule hint, not a hard bound) likewise uses the fixed cap.
-            cap_per_rank = self.num_max_dispatch_tokens_per_rank
+            local_tokens = hidden_states.shape[0]
             expected_m = max(
                 1,
                 (
-                    cap_per_rank * ep_group_size * self.router_topk
+                    local_tokens * ep_group_size * self.router_topk
                     + self.num_experts
                 )
                 // self.num_experts,
             )
-            masked_max_m = cap_per_rank * ep_group_size
+            # Size the masked slab to the FIXED worst case cap * ep_group_size,
+            # matching DeepEP LL's fixed buffer. A local expert receives the sum
+            # over all ranks of the tokens routed to it; each rank sends at most
+            # `cap` tokens (enforced by the dispatch-entry assert), so the count
+            # is bounded by cap * ep_group_size regardless of DP padding mode
+            # (MAX_LEN / SUM_LEN / skewed). Using the local batch for the slab
+            # would be unsafe: under skewed SUM_LEN decode another rank's larger
+            # batch could overflow this rank's slab.
+            masked_max_m = self.num_max_dispatch_tokens_per_rank * ep_group_size
             total_expanded = recv_hidden_states.shape[0]
 
         return EpV2DispatchOutput(

@@ -9,7 +9,8 @@ DeepEP v1 的 dispatcher 对象、mode 语义或 dispatch/combine 数据结构�
 > 下面「最终设计总览（2026-06-23）」及 exp1 等小节是更早的优化历程，**perf 数字与 exp1「反超 LL +5.4%」结论已被本节取代**，设计与坑仍可参考。
 
 - **生产口径真实 gap：decode（masked + 全 CUDA graph）比 DeepEP LL 慢 ~1.75%。** 测量口径：普通 server（**不是** disagg decode-only fake，后者会放大到 ~12%）、DSv4-Flash-FP8 / H20×8 / DP attn / deep_gemm / cap=128 / ISL=1 OSL=1024 / CC=1024 满批。EPv2 14670 vs LL 14932 tok/s。
-- **exp1（动态 masked slab 尺寸）已回退**（commit `5314799`）：改回固定 `cap × ep_group_size`。原因 ① ragged DP（SUM_LEN/skewed）下按本地 batch 定尺会溢出本地 slab，不安全；② 打满时 batch=cap，max_m 与 LL 恒等，exp1 优势本就归零。
+- **exp1（动态 masked slab 尺寸）已回退**（commit `5314799`）：masked slab `max_m` 与 dispatch `num_max_tokens` 改回固定 `cap × ep_group_size` / `cap`。原因 ① ragged DP（SUM_LEN/skewed）下按本地 batch 定尺会溢出本地 slab，不安全；② 打满时 batch=cap，max_m 与 LL 恒等，exp1 优势本就归零。
+- **expected_m 回归实际 batch（对齐 LL，语义修复，非性能）**：上面的 exp1 回退把 `expected_m`（DeepGEMM masked GEMM 的**调度提示**，不是硬界——真正每-expert 上界是 GPU 上的 `masked_m`）也一并钉成了 cap，但 DeepEP LL（`deepep.py` dispatch_a）一直用**实际 batch** `hidden_states.shape[0]`。当时注释写「应该用 local tokens」却与代码矛盾。改回 `expected_m = (local_tokens × group × topk + E) // E`（容量/slab 仍固定 cap，仅此 hint 用实际 batch；它是 per-rank-local、不需跨 rank 一致，ragged DP 安全）。**A/B 实测（cap=1024 欠载 CC=128，bs≈16/rank）fixed 3600 vs oldcap 3578 tok/s，+0.6% 在噪声内** —— masked GEMM 是 weight-bandwidth-bound，expected_m 给 3 还是 192 不改变要读的权重量，故无性能收益；价值在正确性/对齐。满批下 local_tokens==cap，与旧版逐位相等（no-op）。
 - **repack 向量化**（commit `91592c5`，本轮主要优化）：`expand_to_masked_slab` / `masked_slab_to_expand` 从「grid=32、串行逐行拷」改成 2D block-row grid（`(E, cdiv(MAX_M,8))`，每 program 拷 8 行，cuda-graph-safe）。repack 56.7→8.6ms；**combine 自愈 57.2→35.5ms（未改 combine，repack 均匀后消除 rank 失同步，spin-wait 尾部收缩，反超 LL 41ms）**；总 GPU kernel 576.7→505.1ms（LL 501.2，≈parity）；吞吐 14118→14670（−5.6%→−1.75%）。
 - **combine gap 根因 = repack 引起的 spin-wait，不是 combine kernel**：EPv2 combine 中位 23µs 比 LL 31µs 快（单测与生产 trace 一致），慢的是被 repack 拖出的尾部；repack 向量化后该尾部自动收敛。
 - **contiguous（免 repack）= 死路**（A/B 实测否决）：关 graph 下 contig≈masked（do_cpu_sync host 气泡抵消省下的 repack）；且 contiguous 的 do_cpu_sync=True 不能 cuda-graph capture → 拿不到 cuda graph 的 **2.7×**（masked+graph 14077 vs nograph 5170）。**生产必须 masked + 全 CUDA graph。**
@@ -38,7 +39,7 @@ expanded→contiguous / 关 CUDA graph 调查保留在文末「历史 profiling 
 - DeepGEMM FP8 路径下，adapter 在 dispatch 前把 BF16 activation 量化成 FP8 activation + scale，再交给 `ElasticBuffer.dispatch`；DeepGEMM 直接消费 dispatcher 返回的 FP8 activation 和 scale。
 - Triton BF16 路径下，dispatcher 返回 BF16 activation、不返回 scale；adapter 在 Triton 前 compact valid rows，在 combine 前 expand 回 EPv2 layout。
 - **EPv2 direct + DeepGEMM FP8 + decode 批次** 使用 masked-GEMM path：
-  - dispatch 仍走 native expanded layout（`do_expand=True`），但设 `do_cpu_sync=False`、按 buffer cap 做固定分配、用静态 `expected_m = max(1, (num_input_tokens*router_topk + num_experts)//num_experts)`、量化用 plain row-major fp8 scale（不在 dispatch 前做 e8m0/TMA 对齐，交给 masked GEMM 自己对齐）。
+  - dispatch 仍走 native expanded layout（`do_expand=True`），但设 `do_cpu_sync=False`、按 buffer **cap** 做固定分配（masked slab `max_m = cap × ep_group_size`）、用 `expected_m = max(1, (local_tokens × ep_group_size × router_topk + num_experts)//num_experts)`（`local_tokens = hidden_states.shape[0]` 实际 batch，对齐 LL，见顶部收口节）、量化用 plain row-major fp8 scale（不在 dispatch 前做 e8m0/TMA 对齐，交给 masked GEMM 自己对齐）。
   - pre-permute `expand_to_masked_slab(...)` 把 expert-packed expanded buffer 重打包成固定 `[E_local, max_m, hidden]` slab + `masked_m`（按真实 per-expert 计数、clamp 到 `max_m`）。
   - GEMM 用 `grouped_gemm_nt_f8f8bf16_masked`，`masked_m` 把计算量收敛到真实 per-expert 行数（不跑 worst-case buffer 全量）。
   - post-permute `masked_slab_to_expand(...)` 把结果写回 EPv2 expanded layout，并**只在真实行上融入 top-k 权重**（不再单独跑全 buffer 的 weight-mul kernel），输出 buffer 用 `torch.empty`（不 zero-fill）。
