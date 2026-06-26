@@ -137,9 +137,30 @@ cap 越大、batch 越大，repack 的固定开销被 GEMM 摊薄，gap 越小�
 
 向量化 repack 后 EPv2 的 GPU kernel 总时间与 LL parity（505 vs 501ms）。
 
-**Prefill（ISL=1024, OSL=1, CC=128）**：EPv2 hybrid ~22223 input tok/s vs DeepEP normal ~21945，**持平**。
+**Prefill（ISL=1024, OSL=1, CC=128, cap=1024，对照 DeepEP normal）**：
 
-**CUDA graph 杠杆**：masked + graph 14077 vs masked + 关 graph 5170 tok/s = **2.7×**，是 decode 单项最大因素。
+| | EPv2 hybrid | DeepEP normal | gap |
+| --- | ---: | ---: | ---: |
+| Input tok/s | **32349** | 31581 | **+2.4%** |
+| Mean TTFT | 3545 ms | 3635 ms | 更优 |
+| 总 GPU kernel | 1980.6 ms | 2046.6 ms | −3.2% |
+
+prefill 阶段两个 backend 都 eager（`cuda graph: False`——prefill seq len 动态，架构上不 capture，与 backend 无关）。
+
+**CUDA graph 杠杆（decode）**：masked + graph 14077 vs masked + 关 graph 5170 tok/s = **2.7×**，是 decode 单项最大因素。
+
+### Decode vs Prefill：通信增益的本质
+
+**EPv2 的 elastic 通信库在 decode 和 prefill 两场景都比 DeepEP 快**（native 库优势）；最终胜负取决于**对照路径是否逼 EPv2 付不对称的 adapter 成本**：
+
+| | EPv2 通信(dispatch+combine) | 对照 | 通信增益 | EPv2 不对称额外成本 | 净结果 |
+| --- | ---: | --- | ---: | --- | ---: |
+| **decode** | 48.3 ms | LL 54.7 ms | **−6.4 (12%)** | repack 8.6 + quant 2.8 ms | **−1.75%** |
+| **prefill** | 289.9 ms | normal 358.1 ms | **−68.2 (19%)** | 无（repack/quant 对称） | **+2.4%** |
+
+- **decode 对照 LL**：LL 是 native 出 masked、零 repack、quant 融在 dispatch kernel 内的**特化路径** → EPv2 为兼容 masked+cuda-graph 被迫付不对称的 repack(8.6ms)+standalone quant(2.8ms) → 通信增益被吃掉 → 净亏。
+- **prefill 对照 normal**：normal 本身就是 contiguous + ep_scatter(repack) + quant，与 EPv2 hybrid **同构对称** → EPv2 通信增益净显现 → 净赢（−66ms ≈ 通信增益 −68ms，其余对称抵消）。
+- prefill 通信增益绝对值大（68 vs 6.4ms）的两个原因：① 通信量大（1024 vs 128 token/rank）；② 对照的 normal 是 legacy intranode 多 kernel（`notify_dispatch+dispatch`、`cached_notify_combine+combine`），EPv2 elastic 的精简优势（dispatch −37%）比对照 LL（低延迟已精简）更大。
 
 ---
 
@@ -178,3 +199,38 @@ masked slab `max_m` 与 dispatch `num_max_tokens` 固定为 `cap × ep_group_siz
 - masked path 只覆盖 `direct + deep_gemm + decode`；direct extend、hybrid、Triton 走各自路径并自动关 graph。
 - adapter 只覆盖 DeepGEMM FP8 与 Triton BF16，其它 runner fail-fast。
 - `EpV2Buffer` 是 singleton（按 group/hidden/topk/cap/dtype/mode/world 做 key），多模型/多 group 混合切换需改显式 per-key 生命周期。
+
+---
+
+## 四、下一步优化方向（按优先级）
+
+### 1. two-phase dispatch + TBO/SBO overlap（最高优先级，会改变当前结论）
+
+**现状**：EPv2 dispatcher 是**单段 `dispatch()/combine()` + 内部 `current_stream_wait()` 强同步**，没有 DeepEP 的 `dispatch_a/dispatch_b/combine_a/combine_b` two-phase 接口；`server_args.py` 对 epv2 **硬拒绝** `--enable-two-batch-overlap` / `--enable-single-batch-overlap`。所以 EPv2 目前完全不能做 comm-compute overlap，`current_stream_wait()` 是死板的串行汇聚点。
+
+**影响（重要）**：当前所有性能数（decode −1.75%、prefill +2.4%）是**「双方都不 overlap 的串行基线」**——当前测试 TBO/SBO 两边都关，对比公平。但 DeepEP 有 two-phase、随时能开 TBO/SBO 把通信 overlap 进另一 micro-batch 的 compute；EPv2 不能。**一旦开启 infra overlap，DeepEP 能隐藏整段通信（prefill ~290ms、decode ~48ms），当前 parity/增益结论会被推翻** → 现在的数不能作为生产（开 TBO）的最终参考。
+
+**可行性（纯 SGLang 侧）**：native ElasticBuffer 本身支持异步（`previous_event`、`async_with_compute_stream`、dispatch 返回 `event`）——是 SGLang 侧主动 `current_stream_wait()` 把异步能力废掉了。改造：把单段 dispatch 拆成 `dispatch_a`（发起、传 `async_with_compute_stream=True`、**不 wait**、返回 event/handle）+ `dispatch_b`（在需要结果处 wait），combine 同理，实现 base dispatcher 的 two-phase 契约，并放开 server_args 拒绝。收益量级（隐藏整段通信）远大于抠 kernel glue（个位数 ms）。
+
+### 2. 解耦重构 + 非-PD mix 支持
+
+**现状**：EPv2 是**单 `_EpV2Impl` + flag 分支**（`use_expand_layout × use_masked × is_extend`）+ 单 adapter（内部 `running_state` flag 区分 masked/contiguous/extend），`--epv2-mode` server init 固定。对照 DeepEP 解耦成两个 dispatch format（`deepep_normal`/`deepep_ll`）+ 两个 impl 类 + 两个 adapter（layout↔phase 绑定到 format，清晰）。
+
+**风险**：非-PD 混合 serving 下，EPv2 单 mode 固定 → 一个 server 无法 prefill/decode 各走最优（direct → decode 好但 prefill 退化；hybrid → prefill 好但 decode 不能 capture）。DeepEP 按 format 动态选 impl，天然支持 mix。
+
+**改造**：按 batch 类型 **per-call 选 `do_expand`**（prefill non-expanded、decode expanded），dispatcher 逻辑解耦成多路径 + two-phase。关键认知：**不需要两套 buffer**——native ElasticBuffer 一套 + per-call `do_expand` 即可通吃两种 layout（`allow_hybrid_mode` 是**多节点通信开关**、与 phase/layout 无关；layout 由 per-call `do_expand` 决定）；DeepEP 也是**一套 buffer**（容量取 normal/LL 的 max）+ 解耦逻辑，并非两套 buffer。所以 EPv2 理想形态 = **DeepEP 式逻辑解耦（多路径 + two-phase）+ EPv2 自己的统一 buffer（per-call do_expand）**，比 DeepEP 更省（buffer 不翻倍）。需实测 `do_expand` 在同一 buffer 实例上混用（expanded/non-expanded 交替）的 handle/psum/容量稳定性。
+
+### 3. 次要
+
+- standalone quant（decode +2.7ms / prefill 对称）**不可消**——需 DeepEP v2 native dispatch 支持传 BF16 内部量化（LL 把量化融在 dispatch kernel 内，EPv2 native API 要求传入已量化 fp8）。
+- `ep_scatter`（prefill/hybrid 的 repack）`grid=num_experts` SM 利用率有上限，但与 DeepEP normal **共用**该 kernel，优化它惠及公共路径、非 EPv2-specific。
+
+### Layout 决策链（重构参考）
+
+```
+① runner capability：deep_gemm+fp8→use_expanded_layout=True；triton→False
+② dispatcher：use_expand_layout = capability AND not allow_hybrid_mode(mode)
+             use_masked        = use_expand_layout AND not is_extend(phase)
+③ adapter：use_masked→masked GEMM；expanded&!masked / non-expanded→contiguous GEMM(m_indices/ep_scatter)
+```
+layout 是 **runner 能力 × mode × phase** 三方综合，GEMM kernel（masked/contiguous）由 adapter 按 phase 选（decode masked=小m可capture，prefill contiguous=大m）。解耦重构应把这三方从 flag 分支拆成清晰路径。
