@@ -301,6 +301,42 @@ Result table:
 | DP+EP NCCL_EP LL | 1024 | 1024 | 6945.98 | 86.32 | 10.75 | 21.50 | PASS |
 | DP+EP NCCL_EP LL | 1024 | 8192 | 4626.85 | 87.41 | 11.37 | 12.79 | PASS |
 
+Supplemental prefill/decode benchmark:
+
+```bash
+RUN_ID=ds_supp_20260629_1008 \
+CONFIGS="tp8 dp8_tp dp8_ep_ncclep_ll" \
+SHAPES="1024:1 8192:1 1:1024" \
+NUM_PROMPTS=3 \
+CONCURRENCY=1 \
+NCCLEP_MAX_DISPATCH=256 \
+/root/menyu/run_dsv4_sync_event_latency_matrix.sh
+```
+
+Latest supplemental result:
+
+```text
+/root/menyu/ncclep_vs_tp_sglang_dsv4_flash/sync_event_latency_matrix_ds_supp_20260629_1008
+```
+
+| Config | ISL | OSL | Mean TTFT ms | Mean TPOT ms | Output tok/s | Total tok/s | Status |
+|---|---:|---:|---:|---:|---:|---:|---|
+| TP | 1024 | 1 | 3082.14 | 0.00 | 0.32 | 332.34 | PASS |
+| DP+TP | 1024 | 1 | 3851.31 | 0.00 | 0.17 | 176.70 | PASS |
+| DP+EP NCCL_EP LL | 1024 | 1 | 4351.52 | 0.00 | 0.15 | 156.03 | PASS |
+| TP | 8192 | 1 | 24816.15 | 0.00 | 0.04 | 330.12 | PASS |
+| DP+TP | 8192 | 1 | 17643.91 | 0.00 | 0.04 | 309.18 | PASS |
+| DP+EP NCCL_EP LL | 8192 | 1 | 17928.70 | 0.00 | 0.04 | 304.42 | PASS |
+| TP | 1 | 1024 | 92.34 | 84.53 | 11.83 | 11.84 | PASS |
+| DP+TP | 1 | 1024 | 915.00 | 85.00 | 11.65 | 11.66 | PASS |
+| DP+EP NCCL_EP LL | 1 | 1024 | 1124.44 | 85.37 | 11.58 | 11.59 | PASS |
+
+Observations:
+
+- For long prefill (`8192/1`), DP+EP NCCL_EP LL is close to DP+TP: total throughput is 304.42 tok/s vs 309.18 tok/s, about 1.5% lower. It is about 7.8% lower than pure TP.
+- For short prefill (`1024/1`), DP+EP NCCL_EP LL is weaker: total throughput is 156.03 tok/s, about 11.7% lower than DP+TP and about 53.0% lower than pure TP.
+- For decode-heavy (`1/1024`), DP+EP NCCL_EP LL is close to pure TP and DP+TP: TPOT is 85.37 ms vs 84.53 ms for pure TP and 85.00 ms for DP+TP.
+
 TP+DP note:
 
 - `tp=8, dp=8, no-dp-attn` is not a valid single-node 8-GPU setting because it tries to allocate beyond 8 device ordinals.
