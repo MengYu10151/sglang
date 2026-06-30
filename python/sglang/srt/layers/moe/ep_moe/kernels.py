@@ -736,19 +736,26 @@ def _fwd_kernel_ep_scatter_1(
         mask=offset_cumsum < num_experts,
         other=0,
     )
-    cumsum = tl.cumsum(tokens_per_expert) - tokens_per_expert
+    aligned_tokens_per_expert = (
+        (tokens_per_expert + BLOCK_E - 1) // BLOCK_E
+    ) * BLOCK_E
+    cumsum = tl.cumsum(aligned_tokens_per_expert) - aligned_tokens_per_expert
     tl.store(expert_start_loc + offset_cumsum, cumsum, mask=offset_cumsum < num_experts)
 
     cur_expert_start = tl.load(expert_start_loc + cur_expert)
     cur_expert_token_num = tl.load(num_recv_tokens_per_expert + cur_expert)
+    cur_expert_aligned_token_num = (
+        (cur_expert_token_num + BLOCK_E - 1) // BLOCK_E
+    ) * BLOCK_E
 
     m_indices_start_ptr = m_indices + cur_expert_start
     off_expert = tl.arange(0, BLOCK_E)
 
-    for start_m in tl.range(0, cur_expert_token_num, BLOCK_E, num_stages=4):
+    for start_m in tl.range(0, cur_expert_aligned_token_num, BLOCK_E, num_stages=4):
+        valid = start_m + off_expert < cur_expert_token_num
         tl.store(
             m_indices_start_ptr + start_m + off_expert,
-            cur_expert,
+            tl.where(valid, cur_expert, -1),
         )
 
 
@@ -936,7 +943,11 @@ def _fwd_kernel_ep_scatter_psum_init(
 
     off_expert = tl.arange(0, BLOCK_E)
     for start_m in tl.range(0, cur_token_num, BLOCK_E, num_stages=4):
-        tl.store(m_indices + cur_start + start_m + off_expert, cur_expert)
+        valid = start_m + off_expert < cur_token_num
+        tl.store(
+            m_indices + cur_start + start_m + off_expert,
+            tl.where(valid, cur_expert, -1),
+        )
 
 
 @torch.no_grad()
@@ -1028,7 +1039,11 @@ def _fwd_kernel_ep_expand_m_indices_init(
     off_expert = tl.arange(0, BLOCK_E)
     for start_m in tl.range(0, aligned_end - cur_start, BLOCK_E, num_stages=4):
         idx = cur_start + start_m + off_expert
-        tl.store(m_indices + idx, cur_expert, mask=idx < aligned_end)
+        tl.store(
+            m_indices + idx,
+            tl.where(idx < cur_end, cur_expert, -1),
+            mask=idx < aligned_end,
+        )
 
 
 @torch.no_grad()
@@ -1068,6 +1083,7 @@ def _fwd_kernel_ep_gather(
     output_tensor_stride0,
     output_tensor_stride1,
     topk_num: tl.constexpr,
+    APPLY_WEIGHTS: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
     cur_block_int32 = tl.program_id(0)
@@ -1095,9 +1111,14 @@ def _fwd_kernel_ep_gather(
                 )
                 source_token_index = source_token_index_int32.to(tl.int64)
 
-                acc_weight = tl.load(
-                    recv_topk_weight + cur_token * recv_topk_weight_stride0 + topk_index
-                )
+                if APPLY_WEIGHTS:
+                    acc_weight = tl.load(
+                        recv_topk_weight
+                        + cur_token * recv_topk_weight_stride0
+                        + topk_index
+                    )
+                else:
+                    acc_weight = 1.0
                 tmp = tl.load(
                     input_tensor
                     + source_token_index * input_tensor_stride0
@@ -1122,6 +1143,7 @@ def ep_gather(
     recv_topk_weight: torch.Tensor,
     input_index: torch.Tensor,
     output_tensor: torch.Tensor,
+    apply_weights: bool = True,
 ):
     num_warps = 2
     num_tokens = output_tensor.shape[0]
@@ -1147,6 +1169,7 @@ def ep_gather(
         output_tensor.stride(0),
         output_tensor.stride(1),
         topk_num=recv_topk_ids.shape[1],
+        APPLY_WEIGHTS=apply_weights,
         num_warps=num_warps,
         BLOCK_D=BLOCK_D,
     )

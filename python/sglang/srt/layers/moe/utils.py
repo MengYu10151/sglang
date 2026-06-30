@@ -325,14 +325,13 @@ def get_epv2_runner_capability(self) -> EpV2RunnerCapability:
         # DeepGEMM consumes expert-major grouped activations. Use EPv2's
         # native expanded layout so the dispatcher copy epilogue writes one
         # row per local expert slot, avoiding an extra SGLang scatter/gather
-        # adapter round-trip on the decode path.
+        # adapter round-trip on the decode path. Scale layout follows the
+        # DeepGEMM wrapper capability: SM100/SM120 MXFP4 paths use packed
+        # UE8M0 scales, while Hopper keeps regular/TMA-aligned float scales.
         return EpV2RunnerCapability(
             output_dtype=output_dtype,
             expert_alignment=128,
-            fp8_scale_tma_aligned=(
-                deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES
-                or deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
-            ),
+            fp8_scale_tma_aligned=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
             fp8_scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
             use_expanded_layout=True,
         )

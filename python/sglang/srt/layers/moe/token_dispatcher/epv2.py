@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from enum import Enum, auto
 from typing import List, NamedTuple, Optional, Tuple
 
@@ -24,6 +25,36 @@ from sglang.srt.layers.moe.utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _debug_tensor_stats(name: str, tensor: Optional[torch.Tensor], rank: int) -> None:
+    if not os.getenv("SGLANG_EPV2_DEBUG_TENSOR"):
+        return
+    if tensor is None:
+        logger.info("EPv2 tensor %s rank=%s tensor=None", name, rank)
+        return
+    if tensor.numel() == 0:
+        logger.info(
+            "EPv2 tensor %s rank=%s shape=%s dtype=%s empty",
+            name,
+            rank,
+            tuple(tensor.shape),
+            tensor.dtype,
+        )
+        return
+    tensor_f = tensor.float()
+    finite = torch.isfinite(tensor_f)
+    logger.info(
+        "EPv2 tensor %s rank=%s shape=%s dtype=%s finite=%s nan=%s inf=%s absmax=%.6f",
+        name,
+        rank,
+        tuple(tensor.shape),
+        tensor.dtype,
+        bool(finite.all().item()),
+        int(torch.isnan(tensor_f).sum().item()),
+        int(torch.isinf(tensor_f).sum().item()),
+        float(torch.nan_to_num(tensor_f, nan=0.0, posinf=0.0, neginf=0.0).abs().max().item()),
+    )
 
 _SCALE_BLOCK_SIZE = 128
 _epv2_import_error: Optional[BaseException] = None
@@ -128,6 +159,42 @@ def _get_allow_hybrid_mode() -> bool:
     return epv2_mode == "hybrid"
 
 
+def _deduplicate_topk_for_epv2(
+    topk_ids: torch.Tensor, topk_weights: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Deduplicate per-token top-k expert ids before ElasticBuffer dispatch.
+
+    DeepEP v2's dispatch epilogue requires all valid top-k lanes that target the
+    same local rank to have distinct local expert ids. Some fused routing paths
+    can produce duplicate ids for a token; preserve the routed contribution by
+    accumulating duplicate weights into the first lane and marking later lanes
+    invalid (-1/0) before entering the native dispatch kernel.
+    """
+    topk = topk_ids.shape[1]
+    if topk <= 1:
+        return topk_ids, topk_weights
+
+    dedup_ids = topk_ids.clone()
+    dedup_weights = topk_weights.clone()
+    for dst in range(1, topk):
+        duplicate = torch.zeros_like(dedup_ids[:, dst], dtype=torch.bool)
+        for src in range(dst):
+            same = (dedup_ids[:, dst] == dedup_ids[:, src]) & (dedup_ids[:, dst] >= 0)
+            dedup_weights[:, src] = torch.where(
+                same,
+                dedup_weights[:, src] + dedup_weights[:, dst],
+                dedup_weights[:, src],
+            )
+            duplicate = duplicate | same
+        dedup_ids[:, dst] = torch.where(
+            duplicate, torch.full_like(dedup_ids[:, dst], -1), dedup_ids[:, dst]
+        )
+        dedup_weights[:, dst] = torch.where(
+            duplicate, torch.zeros_like(dedup_weights[:, dst]), dedup_weights[:, dst]
+        )
+    return dedup_ids, dedup_weights
+
+
 def _quantize_for_epv2_dispatch(
     hidden_states: torch.Tensor, capability: EpV2RunnerCapability
 ):
@@ -221,6 +288,7 @@ class _EpV2Impl:
         self.num_max_dispatch_tokens_per_rank = num_max_dispatch_tokens_per_rank
         self.rank = dist.get_rank(group)
         self._handle = None
+        self._debug_topk_logged = False
 
     def set_runner_capability(self, capability: EpV2RunnerCapability) -> None:
         if self.capability != capability:
@@ -272,19 +340,56 @@ class _EpV2Impl:
         topk_weights = topk_output.topk_weights
         topk_ids = topk_output.topk_ids.to(torch.int64)
         self._validate_common(hidden_states, topk_ids)
+        _debug_tensor_stats("dispatch_input", hidden_states, self.rank)
+        if os.getenv("SGLANG_EPV2_DEBUG_TOPK") and not self._debug_topk_logged:
+            valid = topk_ids >= 0
+            sorted_ids = torch.sort(torch.where(valid, topk_ids, -1), dim=1).values
+            dup_global = (sorted_ids[:, 1:] == sorted_ids[:, :-1]) & (
+                sorted_ids[:, 1:] >= 0
+            )
+            local_dup_total = torch.zeros((), device=topk_ids.device, dtype=torch.int64)
+            for rank_idx in range(dist.get_world_size(self.group)):
+                start = rank_idx * self.num_local_experts
+                end = start + self.num_local_experts
+                local = torch.where(
+                    (topk_ids >= start) & (topk_ids < end), topk_ids - start, -1
+                )
+                local_sorted = torch.sort(local, dim=1).values
+                local_dup_total += (
+                    (local_sorted[:, 1:] == local_sorted[:, :-1])
+                    & (local_sorted[:, 1:] >= 0)
+                ).sum()
+            weight_sum = topk_weights.sum(dim=1)
+            logger.info(
+                "EPv2 debug topk rank=%s tokens=%s topk=%s global_dup=%s "
+                "local_dup=%s weight_sum_min=%.6f weight_sum_max=%.6f sample_ids=%s sample_w=%s",
+                self.rank,
+                topk_ids.shape[0],
+                topk_ids.shape[1],
+                int(dup_global.sum().item()),
+                int(local_dup_total.item()),
+                float(weight_sum.min().item()) if weight_sum.numel() else 0.0,
+                float(weight_sum.max().item()) if weight_sum.numel() else 0.0,
+                topk_ids[:4].detach().cpu().tolist(),
+                topk_weights[:4].detach().float().cpu().tolist(),
+            )
+            self._debug_topk_logged = True
         # EPv2 native expanded layout is profitable for direct/decode-like
         # DeepGEMM FP8 workloads, but regresses hybrid/prefill-like workloads.
         # Keep hybrid on the native default non-expanded layout.
+        is_extend = get_is_extend_in_batch()
         use_expand_layout = (
-            self.capability.use_expanded_layout and not _get_allow_hybrid_mode()
+            self.capability.use_expanded_layout
+            and not _get_allow_hybrid_mode()
+            and not is_extend
         )
         # decode (non-extend) expanded path -> masked-GEMM bridge: async dispatch
         # (cpu_sync=False) gives a static capturable recv shape; the masked GEMM
         # bounds compute by masked_m, so the full (safe) cap costs no extra GEMM.
-        use_masked = use_expand_layout and not get_is_extend_in_batch()
+        use_masked = use_expand_layout and not is_extend
 
         if self._uses_fp8_dispatch_output():
-            if use_masked:
+            if use_masked and not self.capability.fp8_scale_ue8m0:
                 # _run_masked_gemm consumes plain per-token-group fp32 scales and
                 # does its own e8m0/tma-major alignment, so dispatch a plain
                 # row-major scale (no col-major, no tma, no e8m0 pre-pack).
@@ -341,6 +446,9 @@ class _EpV2Impl:
             recv_hidden_states = recv_x
             recv_hidden_states_scale = None
 
+        _debug_tensor_stats("recv_hidden", recv_hidden_states, self.rank)
+        _debug_tensor_stats("recv_scale", recv_hidden_states_scale, self.rank)
+
         if use_expand_layout:
             # Expanded layout already has one row per local expert slot. There is
             # no recv_topk_idx tensor in this native layout; combine uses handle
@@ -361,7 +469,20 @@ class _EpV2Impl:
             # expert ids and marks non-local choices as -1. Keep it on-GPU and avoid
             # an unnecessary max().item() synchronization in the decode path.
             local_topk_ids = recv_topk_idx
-            num_recv_tokens_per_expert = list(handle.num_recv_tokens_per_expert_list)
+            valid_local_topk_ids = local_topk_ids[local_topk_ids >= 0]
+            num_recv_tokens_per_expert = torch.bincount(
+                valid_local_topk_ids,
+                minlength=self.num_local_experts,
+            ).to(torch.int32)
+            if os.getenv("SGLANG_EPV2_DEBUG_TENSOR"):
+                counts_list = num_recv_tokens_per_expert.detach().cpu().tolist()
+                logger.info(
+                    "EPv2 non-expanded recv counts rank=%s sum=%s nonzero=%s counts=%s",
+                    self.rank,
+                    sum(counts_list),
+                    sum(1 for x in counts_list if x),
+                    counts_list,
+                )
 
         expected_m = 0
         masked_max_m = 0
@@ -401,7 +522,7 @@ class _EpV2Impl:
             local_topk_ids,
             recv_topk_weights,
             num_recv_tokens_per_expert,
-            handle.psum_num_recv_tokens_per_expert,
+            handle.psum_num_recv_tokens_per_expert if use_expand_layout else None,
             use_expand_layout,
             use_tma_aligned_col_major_sf,
             use_masked,
@@ -417,6 +538,7 @@ class _EpV2Impl:
 
         buffer = self._get_buffer()
         try:
+            _debug_tensor_stats("combine_input", combine_input.hidden_states, self.rank)
             combined_x, _, event = buffer.combine(
                 combine_input.hidden_states,
                 handle=self._handle,
@@ -424,6 +546,7 @@ class _EpV2Impl:
             )
             if event.event is not None:
                 event.current_stream_wait()
+            _debug_tensor_stats("combine_output", combined_x, self.rank)
             return combined_x
         finally:
             self._destroy_handle()

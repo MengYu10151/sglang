@@ -1,5 +1,4 @@
 from __future__ import annotations
-
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
@@ -99,6 +98,7 @@ class DeepGemmRunnerInput(RunnerInput):
     expected_m: Optional[int] = None
     m_indices: Optional[torch.Tensor] = None
     hidden_states_scale_tma_aligned: bool = False
+    use_psum_layout: bool = False
 
     @property
     def runner_backend(self) -> MoeRunnerBackend:
@@ -225,8 +225,11 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             m_indices,
             recipe_a=recipe_a,
             recipe_b=recipe_b,
+            use_psum_layout=runner_input.use_psum_layout,
+            expected_m_for_psum_layout=runner_input.expected_m
+            if runner_input.use_psum_layout
+            else None,
         )
-
         dispose_tensor(hidden_states)
         dispose_tensor(hidden_states_scale)
 
@@ -308,8 +311,11 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             m_indices,
             recipe_a=recipe_a,
             recipe_b=recipe_b,
+            use_psum_layout=runner_input.use_psum_layout,
+            expected_m_for_psum_layout=runner_input.expected_m
+            if runner_input.use_psum_layout
+            else None,
         )
-
         return down_output
 
     def _run_bf16_contiguous_gemm(
@@ -1011,30 +1017,19 @@ def pre_permute_epv2_to_deep_gemm(
         running_state["epv2_expanded"] = True
 
         if epv2_use_masked:
-            # Masked-GEMM bridge: repack the expanded expert-packed buffer into a
-            # regular [E_local, max_m, hidden] slab so DeepGEMM's masked grouped
-            # GEMM bounds compute by per-expert real counts (masked_m), decoupled
-            # from the dispatch capacity. Static shapes -> cuda-graph safe.
-            from sglang.srt.layers.moe.ep_moe.kernels import expand_to_masked_slab
-
-            num_local_experts = psum_num_recv_tokens_per_expert.shape[0]
-            slab, slab_scale, masked_m = expand_to_masked_slab(
-                hidden_states,
-                hidden_states_scale,
-                psum_num_recv_tokens_per_expert,
-                num_local_experts,
-                epv2_masked_max_m,
-                epv2_expert_alignment,
-            )
-            running_state["epv2_masked"] = True
+            # EPv2 expanded output is already a prefix-sum expert layout. Use
+            # DeepGEMM's native psum contiguous path directly instead of repacking
+            # to a masked slab and then repacking back to expanded order.
+            running_state["epv2_masked"] = False
             running_state["epv2_psum"] = psum_num_recv_tokens_per_expert
             running_state["epv2_total_expanded"] = epv2_total_expanded
             running_state["epv2_expert_alignment"] = epv2_expert_alignment
             return DeepGemmRunnerInput(
-                hidden_states=slab,
-                hidden_states_scale=slab_scale,
-                use_masked_gemm=True,
-                masked_m=masked_m,
+                hidden_states=hidden_states,
+                hidden_states_scale=hidden_states_scale,
+                use_masked_gemm=False,
+                m_indices=psum_num_recv_tokens_per_expert,
+                use_psum_layout=True,
                 expected_m=epv2_expected_m,
                 hidden_states_scale_tma_aligned=hidden_states_scale_tma_aligned,
             )
@@ -1056,6 +1051,12 @@ def pre_permute_epv2_to_deep_gemm(
     if psum_num_recv_tokens_per_expert is not None:
         all_tokens = int(psum_num_recv_tokens_per_expert[-1].item())
         num_recv_tokens_per_expert_gpu = None
+    elif isinstance(num_recv_tokens_per_expert, torch.Tensor):
+        num_recv_tokens_per_expert_gpu = num_recv_tokens_per_expert.to(torch.int32)
+        aligned_num_recv_tokens_per_expert = (
+            (num_recv_tokens_per_expert_gpu + 127) // 128
+        ) * 128
+        all_tokens = int(aligned_num_recv_tokens_per_expert.sum().item())
     else:
         num_recv_tokens_per_expert = [
             ceil_div(x, 128) * 128 for x in num_recv_tokens_per_expert
@@ -1085,7 +1086,12 @@ def pre_permute_epv2_to_deep_gemm(
         input_tensor_scale = torch.zeros(
             (all_tokens, K // 128), device=hidden_states.device, dtype=torch.float32
         )
-    m_indices = torch.empty(all_tokens, device=hidden_states.device, dtype=torch.int32)
+    # all_tokens can include expert-aligned padding rows. The scatter kernel only
+    # writes real routed-token slots, so initialize padding m_indices to -1 to
+    # keep DeepGEMM from reading garbage expert ids for padded rows.
+    m_indices = torch.full(
+        (all_tokens,), -1, device=hidden_states.device, dtype=torch.int32
+    )
     output_index = torch.empty_like(topk_ids)
     if psum_num_recv_tokens_per_expert is not None:
         expert_start_loc = torch.empty_like(psum_num_recv_tokens_per_expert)
