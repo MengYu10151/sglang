@@ -57,7 +57,7 @@ _is_cuda = is_cuda()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_musa = is_musa()
 
-# Imported only for the SGLANG_OPT_FIX_MEGA_MOE_MEMORY=False fallback path.
+# Imported for the non-fused activation fallback path.
 if not (_is_npu or _is_hip) and _is_cuda:
     from sglang.jit_kernel.activation import silu_and_mul as _legacy_silu_and_mul
 elif _is_musa:
@@ -74,7 +74,7 @@ _DEEPGEMM_ON_H20 = get_bool_env_var("SGLANG_DEEPGEMM_ON_H20")
 # `fill_gateup_input_triton_kernel` to directly generate e8m0 scale.
 @torch.compile(disable=_is_hip or _is_npu)
 def _cast_to_e8m0_with_rounding_up(x: torch.Tensor) -> torch.Tensor:
-    temp = x.to(torch.float32).view(torch.int32)
+    temp = x.to(torch.float32).contiguous().view(torch.int32)
     exp = torch.bitwise_right_shift(temp, 23)
     mant = torch.bitwise_and(temp, 0x7FFFFF)
     is_ru = torch.logical_and(
@@ -82,8 +82,14 @@ def _cast_to_e8m0_with_rounding_up(x: torch.Tensor) -> torch.Tensor:
         ~torch.logical_and((exp == 0), (mant <= 0x400000)),
     )
     exp = torch.where(is_ru, exp + 1, exp)
-    new_x = exp.to(torch.uint8).view(torch.int)
-    return new_x.transpose(1, 2).contiguous().transpose(1, 2)
+    exp_u32 = exp.to(torch.int32)
+    packed = (
+        exp_u32[..., 0::4]
+        | torch.bitwise_left_shift(exp_u32[..., 1::4], 8)
+        | torch.bitwise_left_shift(exp_u32[..., 2::4], 16)
+        | torch.bitwise_left_shift(exp_u32[..., 3::4], 24)
+    )
+    return packed.transpose(1, 2).contiguous().transpose(1, 2)
 
 
 def copy_list_to_gpu_no_ce(arr: List[int]):
@@ -148,10 +154,13 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         assert self.config.activation == "silu"
         assert self.config.is_gated
         self.swiglu_limit = self.config.swiglu_limit
+        self.use_fused_activation = (
+            envs.SGLANG_OPT_SWIGLU_CLAMP_FUSION.get()
+            and envs.SGLANG_OPT_USE_JIT_EP_ACTIVATION.get()
+        )
         self.use_swizzle = False
         if envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.get():
-            assert envs.SGLANG_OPT_SWIGLU_CLAMP_FUSION.get()
-            assert envs.SGLANG_OPT_USE_JIT_EP_ACTIVATION.get()
+            assert self.use_fused_activation
             self.use_swizzle = True
 
     def run(
@@ -246,11 +255,8 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         dispose_tensor(hidden_states)
         dispose_tensor(hidden_states_scale)
 
-        if envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.get():
+        if self.swiglu_limit is not None and self.use_fused_activation:
             swiglu_limit_arg: Optional[float] = self.swiglu_limit
-            use_contig_swizzle = self.use_swizzle and not running_state.get(
-                "deepep_v2_disable_contig_swizzle", False
-            )
 
             down_input_fp8 = torch.empty(
                 (all_tokens, N // 2),
@@ -273,13 +279,11 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
                 transposed=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
                 swiglu_limit=swiglu_limit_arg,
-                swizzle=use_contig_swizzle,
+                swizzle=self.use_swizzle,
             )
             del gateup_output
         else:
-            # Hacky byte-equal fallback that reproduces the optimize-branch
-            # code path exactly: bf16 silu_and_mul then a separate per-token
-            # group fp8 quant. Kept behind the mega-moe-memory flag.
+            # Non-fused path: BF16 silu_and_mul followed by per-token FP8 quant.
             from sglang.kernels.ops.quantization.fp8_kernel import (
                 sglang_per_token_group_quant_fp8,
             )
@@ -489,7 +493,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 envs.SGLANG_OPT_USE_JIT_EP_ACTIVATION.get()
             ), "DeepSeek V4 requires SGLANG_OPT_USE_JIT_EP_ACTIVATION=True"
 
-            if envs.SGLANG_OPT_SWIGLU_CLAMP_FUSION.get():
+            if self.use_fused_activation:
                 swiglu_limit_arg = self.swiglu_limit
             else:
                 gateup_output = einops.rearrange(
@@ -1133,12 +1137,6 @@ def pre_permute_deepep_v2_to_deep_gemm(
             "DeepEP v2 -> DeepGEMM requires FP8 dispatch output with activation scales. "
             "Use --deepep-v2-dispatcher-output-dtype fp8 or select a BF16 runner such as triton."
         )
-    if envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.get():
-        # The MegaMoE memory optimization enables a swizzled activation kernel
-        # for its gran=8 interleaved gate/up layout. DeepEP v2's contiguous adapter
-        # is validated with the non-swizzled activation layout; using the
-        # swizzled reader here mixes gate/up pairs and breaks generation.
-        running_state["deepep_v2_disable_contig_swizzle"] = True
     assert runner_config.activation == "silu"
 
     if is_expanded:
